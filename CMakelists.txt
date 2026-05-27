@@ -1,0 +1,14 @@
+cmake_minimum_required(VERSION 3.10)
+project(PotatoStandardLibrary VERSION 0.1.0 LANGUAGES CXX)
+
+option(POTATO_STANDARD_BUILD_TESTS "Build tests under Test/." ${PROJECT_IS_TOP_LEVEL})
+
+add_subdirectory(PotatoStandard)
+
+if(POTATO_STANDARD_BUILD_TESTS)
+	include(CTest)
+
+	if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Test/CMakeLists.txt")
+		add_subdirectory(Test)
+	endif()
+endif()
