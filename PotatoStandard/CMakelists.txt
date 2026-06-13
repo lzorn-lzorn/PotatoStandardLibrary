@@ -33,7 +33,7 @@ endif()
 
 add_library(PotatoStandard::PotatoStandard ALIAS PotatoStandard)
 
-target_compile_features(PotatoStandard ${POTATO_STANDARD_USAGE_SCOPE} cxx_std_20)
+target_compile_features(PotatoStandard ${POTATO_STANDARD_USAGE_SCOPE} cxx_std_23)
 target_include_directories(
 	PotatoStandard
 	${POTATO_STANDARD_USAGE_SCOPE}

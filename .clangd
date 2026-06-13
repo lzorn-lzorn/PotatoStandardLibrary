@@ -1,0 +1,12 @@
+CompileFlags:
+  CompilationDatabase: Ancestors
+  Add:
+    - -std=c++23
+    - -IPotatoStandard/Include
+
+Index:
+  Background: Build
+
+Completion:
+  AllScopes: Yes
+  HeaderInsertion: IWYU
