@@ -4,6 +4,7 @@
 #include <functional>
 #include <type_traits>
 #include <utility>
+#include <atomic>
 
 namespace ptd
 {
@@ -131,11 +132,6 @@ public:
 	constexpr Value_Storage& operator=(const Value_Storage&) = default;
 	constexpr Value_Storage& operator=(Value_Storage&&) = default;
 
-	[[nodiscard]] constexpr bool HasValue() const noexcept
-	{
-		return true;
-	}
-
 	[[nodiscard]] constexpr Ty& Value() noexcept
 	{
 		return m_value;
@@ -176,7 +172,7 @@ private:
 		}
 
 		Fn observer;
-		Node* next = nullptr;
+		std::atomic<Node*> next = nullptr;
 	};
 
 public:
@@ -189,16 +185,18 @@ public:
 
 	ObserverList(const ObserverList& other)
 	{
-		for (Node* current = other.m_head; current != nullptr; current = current->next)
+		for (Node* current = other.m_head.load(std::memory_order_acquire); current != nullptr; current = current->next.load(std::memory_order_acquire))
 		{
 			PushBack(current->observer);
 		}
 	}
 
 	ObserverList(ObserverList&& other) noexcept
-		: m_head(std::exchange(other.m_head, nullptr))
-		, m_tail(std::exchange(other.m_tail, nullptr))
+		: m_head(other.m_head.load(std::memory_order_relaxed))
+		, m_tail(other.m_tail.load(std::memory_order_relaxed))
 	{
+		other.m_head.store(nullptr, std::memory_order_relaxed);
+		other.m_tail.store(nullptr, std::memory_order_relaxed);
 	}
 
 	ObserverList& operator=(const ObserverList& other)
@@ -221,8 +219,10 @@ public:
 		}
 
 		Clear();
-		m_head = std::exchange(other.m_head, nullptr);
-		m_tail = std::exchange(other.m_tail, nullptr);
+		m_head.store(other.m_head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		m_tail.store(other.m_tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		other.m_head.store(nullptr, std::memory_order_relaxed);
+		other.m_tail.store(nullptr, std::memory_order_relaxed);
 		return *this;
 	}
 
@@ -239,7 +239,7 @@ public:
 	template <typename Callback>
 	void ForEach(Callback&& callback) const
 	{
-		for (Node* current = m_head; current != nullptr; current = current->next)
+		for (Node* current = m_head.load(std::memory_order_acquire); current != nullptr; current = current->next.load(std::memory_order_acquire))
 		{
 			std::forward<Callback>(callback)(current->observer);
 		}
@@ -250,37 +250,69 @@ public:
 		Node* current = m_head;
 		while (current != nullptr)
 		{
-			Node* next = current->next;
+			Node* next = current->next.load(std::memory_order_relaxed);
 			delete current;
 			current = next;
 		}
 
-		m_head = nullptr;
-		m_tail = nullptr;
+		m_head.store(nullptr, std::memory_order_relaxed);
+		m_tail.store(nullptr, std::memory_order_relaxed);
 	}
 
 	constexpr void Swap(ObserverList& other) noexcept
 	{
-		std::swap(m_head, other.m_head);
-		std::swap(m_tail, other.m_tail);
+		Node* temp_head = m_head.load(std::memory_order_relaxed);
+		Node* temp_tail = m_tail.load(std::memory_order_relaxed);
+		m_head.store(other.m_head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		m_tail.store(other.m_tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		other.m_head.store(temp_head, std::memory_order_relaxed);
+		other.m_tail.store(temp_tail, std::memory_order_relaxed);
 	}
 
 private:
 	void AppendNode(Node* node) noexcept
 	{
-		if (m_tail == nullptr)
-		{
-			m_head = node;
-			m_tail = node;
-			return;
-		}
+		Node* new_node = node;
+		new_node->next.store(nullptr, std::memory_order_relaxed);
 
-		m_tail->next = node;
-		m_tail = node;
+		/* Michael-Scott 算法 */
+		while(true)
+		{
+			Node* tail = m_tail.load(std::memory_order_relaxed);
+			Node* next = tail->next.load(std::memory_order_acquire);
+
+			if(tail == m_tail.load(std::memory_order_acquire))
+			{
+				if(next == nullptr)
+				{
+					if(tail->next.compare_exchange_weak(
+						next, 
+						new_node, 
+						std::memory_order_release, 
+						std::memory_order_relaxed))
+					{
+						m_tail.compare_exchange_strong(
+							tail, 
+							new_node, 
+							std::memory_order_release,
+							std::memory_order_relaxed);
+						return;
+					}
+				}
+				else
+				{
+					m_tail.compare_exchange_weak(
+						tail, 
+						next, 
+						std::memory_order_release, 
+						std::memory_order_relaxed);
+				}
+			}
+		}
 	}
 
-	Node* m_head = nullptr;
-	Node* m_tail = nullptr;
+	std::atomic<Node*> m_head = nullptr;
+	std::atomic<Node*> m_tail = nullptr;
 };
 
 }  // namespace details

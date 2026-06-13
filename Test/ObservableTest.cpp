@@ -71,13 +71,13 @@ constexpr bool ObservableConstexprWorks()
 	ptd::Observable<int>::Modify([](int& value, int delta) {
 		value += delta;
 	}, observable, 1);
-	return observable.HasValue() && observable.GetValue() == 11;
+	return  observable.GetValue() == 11;
 }
 
 constexpr bool ObservableDefaultConstructionValueInitializes()
 {
 	ptd::Observable<int> observable;
-	return observable.HasValue() && observable.GetValue() == 0;
+	return observable.GetValue() == 0;
 }
 
 template <typename Ty>
@@ -93,7 +93,7 @@ void TestContainerMutationNotifications(TestContext& context)
 	std::size_t notification_count = 0;
 	std::size_t last_size = 0;
 
-	context.Expect(observable.HasValue(), "default-constructed observable should report a value");
+	context.Expect(observable.GetValue().empty(), "default-constructed observable should report an empty value");
 
 	observable.Subscribe([&](const std::vector<int>& values) {
 		++notification_count;
