@@ -63,12 +63,12 @@ struct TestContext
 
 constexpr bool ObservableConstexprWorks()
 {
-	ptd::Observable<int> observable(std::in_place, 3);
+	ptd::Observed<int> observable(std::in_place, 3);
 	observable.SetValue(5);
 	observable.Modify([](int& value) {
 		value *= 2;
 	});
-	ptd::Observable<int>::Modify([](int& value, int delta) {
+	ptd::Observed<int>::Modify([](int& value, int delta) {
 		value += delta;
 	}, observable, 1);
 	return  observable.GetValue() == 11;
@@ -76,7 +76,7 @@ constexpr bool ObservableConstexprWorks()
 
 constexpr bool ObservableDefaultConstructionValueInitializes()
 {
-	ptd::Observable<int> observable;
+	ptd::Observed<int> observable;
 	return observable.GetValue() == 0;
 }
 
@@ -89,7 +89,7 @@ void AssignToSelf(Ty& value)
 
 void TestContainerMutationNotifications(TestContext& context)
 {
-	ptd::Observable<std::vector<int>> observable;
+	ptd::Observed<std::vector<int>> observable;
 	std::size_t notification_count = 0;
 	std::size_t last_size = 0;
 
@@ -110,7 +110,7 @@ void TestContainerMutationNotifications(TestContext& context)
 	context.Expect(notification_count == 2, "Modify should notify after appending to the container");
 	context.Expect(last_size == 3, "Modify should expose the appended size");
 
-	ptd::Observable<std::vector<int>>::Modify([](std::vector<int>& values) {
+	ptd::Observed<std::vector<int>>::Modify([](std::vector<int>& values) {
 		values.erase(values.begin());
 	}, observable);
 	context.Expect(notification_count == 3, "static Modify should notify observers");
@@ -130,7 +130,7 @@ void TestContainerMutationNotifications(TestContext& context)
 
 void TestMultipleObserversKeepRegistrationOrder(TestContext& context)
 {
-	ptd::Observable<int> observable(0);
+	ptd::Observed<int> observable(0);
 	std::vector<int> order;
 
 	observable.Subscribe([&](const int& value) {
@@ -148,14 +148,14 @@ void TestMultipleObserversKeepRegistrationOrder(TestContext& context)
 
 void TestCopyConstructionDoesNotCopyObservers(TestContext& context)
 {
-	ptd::Observable<int> source(7);
+	ptd::Observed<int> source(7);
 	int source_notifications = 0;
 
 	source.Subscribe([&](const int&) {
 		++source_notifications;
 	});
 
-	ptd::Observable<int> copy(source);
+	ptd::Observed<int> copy(source);
 	copy.SetValue(9);
 
 	context.Expect(copy.GetValue() == 9, "copy-constructed observable should hold the copied value");
@@ -167,8 +167,8 @@ void TestCopyConstructionDoesNotCopyObservers(TestContext& context)
 
 void TestCopyAssignmentPreservesDestinationObservers(TestContext& context)
 {
-	ptd::Observable<std::string> source("alpha");
-	ptd::Observable<std::string> destination("omega");
+	ptd::Observed<std::string> source("alpha");
+	ptd::Observed<std::string> destination("omega");
 	int source_notifications = 0;
 	int destination_notifications = 0;
 	std::string seen_value;
@@ -195,14 +195,14 @@ void TestCopyAssignmentPreservesDestinationObservers(TestContext& context)
 
 void TestMoveConstructionDoesNotTransferObservers(TestContext& context)
 {
-	ptd::Observable<int> source(12);
+	ptd::Observed<int> source(12);
 	int source_notifications = 0;
 
 	source.Subscribe([&](const int&) {
 		++source_notifications;
 	});
 
-	ptd::Observable<int> moved(std::move(source));
+	ptd::Observed<int> moved(std::move(source));
 	moved.SetValue(20);
 
 	context.Expect(moved.GetValue() == 20, "move construction should transfer the value state");
@@ -211,8 +211,8 @@ void TestMoveConstructionDoesNotTransferObservers(TestContext& context)
 
 void TestMoveAssignmentPreservesDestinationObservers(TestContext& context)
 {
-	ptd::Observable<int> source(3);
-	ptd::Observable<int> destination(8);
+	ptd::Observed<int> source(3);
+	ptd::Observed<int> destination(8);
 	int source_notifications = 0;
 	int destination_notifications = 0;
 	int seen_value = 0;
@@ -239,7 +239,7 @@ void TestMoveAssignmentPreservesDestinationObservers(TestContext& context)
 
 void TestSelfAssignmentKeepsObservers(TestContext& context)
 {
-	ptd::Observable<int> observable(4);
+	ptd::Observed<int> observable(4);
 	int notifications = 0;
 
 	observable.Subscribe([&](const int&) {
@@ -255,7 +255,7 @@ void TestSelfAssignmentKeepsObservers(TestContext& context)
 
 void TestValueAssignmentFallbackForNonMoveAssignable(TestContext& context)
 {
-	ptd::Observable<CopyAssignOnly> observable(std::in_place, 1);
+	ptd::Observed<CopyAssignOnly> observable(std::in_place, 1);
 	observable = CopyAssignOnly{9};
 	context.Expect(observable.GetValue().value == 9, "rvalue value assignment should fall back to copy assignment when move assignment is unavailable");
 }
@@ -264,17 +264,20 @@ void TestValueAssignmentFallbackForNonMoveAssignable(TestContext& context)
 
 int main()
 {
-	static_assert(std::copy_constructible<ptd::Observable<std::string>>);
-	static_assert(std::is_copy_assignable_v<ptd::Observable<std::string>>);
-	static_assert(!std::copy_constructible<ptd::Observable<MoveOnly>>);
-	static_assert(!std::is_copy_assignable_v<ptd::Observable<MoveOnly>>);
-	static_assert(std::move_constructible<ptd::Observable<MoveOnly>>);
-	static_assert(std::is_move_assignable_v<ptd::Observable<MoveOnly>>);
-	static_assert(!std::default_initializable<ptd::Observable<NonDefaultConstructible>>);
-	static_assert(std::constructible_from<ptd::Observable<NonDefaultConstructible>, std::in_place_t, int>);
-	static_assert(std::same_as<typename ptd::Observable<int>::value_type, int>);
-	static_assert(ObservableDefaultConstructionValueInitializes());
-	static_assert(ObservableConstexprWorks());
+	static_assert(std::copy_constructible<ptd::Observed<std::string>>);
+	static_assert(std::is_copy_assignable_v<ptd::Observed<std::string>>);
+	static_assert(!std::copy_constructible<ptd::Observed<MoveOnly>>);
+	static_assert(!std::is_copy_assignable_v<ptd::Observed<MoveOnly>>);
+	static_assert(std::move_constructible<ptd::Observed<MoveOnly>>);
+	static_assert(std::is_move_assignable_v<ptd::Observed<MoveOnly>>);
+	static_assert(!std::default_initializable<ptd::Observed<NonDefaultConstructible>>);
+	static_assert(std::constructible_from<ptd::Observed<NonDefaultConstructible>, std::in_place_t, int>);
+	static_assert(std::same_as<typename ptd::Observed<int>::value_type, int>);
+
+
+	ObservableDefaultConstructionValueInitializes();
+	ObservableConstexprWorks();
+
 
 	TestContext context;
 	TestContainerMutationNotifications(context);
@@ -286,7 +289,7 @@ int main()
 	TestSelfAssignmentKeepsObservers(context);
 	TestValueAssignmentFallbackForNonMoveAssignable(context);
 
-	std::println("Final sizeof Observable int: {}", sizeof(ptd::Observable<int>));
+	std::println("Final sizeof Observed int: {}", sizeof(ptd::Observed<int>));
 	std::println("Final sizeof vector int: {}", sizeof(std::vector<int*>));
 	return context.failures;
 }

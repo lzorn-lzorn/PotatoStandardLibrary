@@ -163,162 +163,198 @@ template <typename Fn>
 class ObserverList
 {
 private:
-	struct Node
-	{
-		template <typename Value>
-		explicit Node(Value&& value)
-			: observer(std::forward<Value>(value))
-		{
-		}
+    struct Node
+    {
+        template <typename Value>
+        explicit Node(Value&& value)
+            : observer(std::forward<Value>(value))
+        {
+        }
 
-		Fn observer;
-		std::atomic<Node*> next = nullptr;
-	};
+        // 专门用于 dummy 节点的构造函数
+        Node() = default;
+
+        Fn observer;
+        std::atomic<Node*> next{nullptr};
+    };
+
+    // 静态断言保证 Fn 可默认构造，否则 dummy 节点无法创建
+    static_assert(std::default_initializable<Fn>,
+        "ObserverList requires default-constructible function type for internal dummy node");
 
 public:
-	constexpr ObserverList() = default;
+    ObserverList()
+    {
+        Node* dummy = new Node();
+        dummy->next.store(nullptr, std::memory_order_relaxed);
+        m_head.store(dummy, std::memory_order_relaxed);
+        m_tail.store(dummy, std::memory_order_relaxed);
+    }
 
-	constexpr ~ObserverList()
-	{
-		Clear();
-	}
+    ~ObserverList()
+    {
+        Clear();
+        // 清除 dummy 节点
+        delete m_head.load(std::memory_order_relaxed);
+    }
 
-	ObserverList(const ObserverList& other)
-	{
-		for (Node* current = other.m_head.load(std::memory_order_acquire); current != nullptr; current = current->next.load(std::memory_order_acquire))
-		{
-			PushBack(current->observer);
-		}
-	}
+    ObserverList(const ObserverList& other)
+    {
+        // 先创建 dummy
+        Node* dummy = new Node();
+        dummy->next.store(nullptr, std::memory_order_relaxed);
+        m_head.store(dummy, std::memory_order_relaxed);
+        m_tail.store(dummy, std::memory_order_relaxed);
 
-	ObserverList(ObserverList&& other) noexcept
-		: m_head(other.m_head.load(std::memory_order_relaxed))
-		, m_tail(other.m_tail.load(std::memory_order_relaxed))
-	{
-		other.m_head.store(nullptr, std::memory_order_relaxed);
-		other.m_tail.store(nullptr, std::memory_order_relaxed);
-	}
+        // 遍历 other 的有效节点（跳过 dummy）
+        Node* current = other.m_head.load(std::memory_order_acquire);
+        if (current) current = current->next.load(std::memory_order_acquire); // 跳过 dummy
 
-	ObserverList& operator=(const ObserverList& other)
-	{
-		if (this == &other)
-		{
-			return *this;
-		}
+        for (; current != nullptr; current = current->next.load(std::memory_order_acquire))
+        {
+            PushBack(current->observer);
+        }
+    }
 
-		ObserverList temp(other);
-		Swap(temp);
-		return *this;
-	}
+    ObserverList(ObserverList&& other) noexcept
+        : m_head(other.m_head.load(std::memory_order_relaxed))
+        , m_tail(other.m_tail.load(std::memory_order_relaxed))
+    {
+        // 让 other 回到合法空状态（需要重建 dummy）
+        Node* dummy = new Node();
+        dummy->next.store(nullptr, std::memory_order_relaxed);
+        other.m_head.store(dummy, std::memory_order_relaxed);
+        other.m_tail.store(dummy, std::memory_order_relaxed);
+    }
 
-	ObserverList& operator=(ObserverList&& other) noexcept
-	{
-		if (this == &other)
-		{
-			return *this;
-		}
+    ObserverList& operator=(const ObserverList& other)
+    {
+        if (this == &other)
+            return *this;
+        ObserverList temp(other);
+        Swap(temp);
+        return *this;
+    }
 
-		Clear();
-		m_head.store(other.m_head.load(std::memory_order_relaxed), std::memory_order_relaxed);
-		m_tail.store(other.m_tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
-		other.m_head.store(nullptr, std::memory_order_relaxed);
-		other.m_tail.store(nullptr, std::memory_order_relaxed);
-		return *this;
-	}
+    ObserverList& operator=(ObserverList&& other) noexcept
+    {
+        if (this == &other)
+            return *this;
 
-	void PushBack(const Fn& observer)
-	{
-		AppendNode(new Node(observer));
-	}
+        Clear();
+        // 先删除当前 dummy
+        Node* old_dummy = m_head.load(std::memory_order_relaxed);
+        delete old_dummy;
 
-	void PushBack(Fn&& observer)
-	{
-		AppendNode(new Node(std::move(observer)));
-	}
+        m_head.store(other.m_head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_tail.store(other.m_tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
 
-	template <typename Callback>
-	void ForEach(Callback&& callback) const
-	{
-		for (Node* current = m_head.load(std::memory_order_acquire); current != nullptr; current = current->next.load(std::memory_order_acquire))
-		{
-			std::forward<Callback>(callback)(current->observer);
-		}
-	}
+        // 让 other 重建 dummy
+        Node* new_dummy = new Node();
+        new_dummy->next.store(nullptr, std::memory_order_relaxed);
+        other.m_head.store(new_dummy, std::memory_order_relaxed);
+        other.m_tail.store(new_dummy, std::memory_order_relaxed);
+        return *this;
+    }
 
-	constexpr void Clear() noexcept
-	{
-		Node* current = m_head;
-		while (current != nullptr)
-		{
-			Node* next = current->next.load(std::memory_order_relaxed);
-			delete current;
-			current = next;
-		}
+    void PushBack(const Fn& observer)
+    {
+        AppendNode(new Node(observer));
+    }
 
-		m_head.store(nullptr, std::memory_order_relaxed);
-		m_tail.store(nullptr, std::memory_order_relaxed);
-	}
+    void PushBack(Fn&& observer)
+    {
+        AppendNode(new Node(std::move(observer)));
+    }
 
-	constexpr void Swap(ObserverList& other) noexcept
-	{
-		Node* temp_head = m_head.load(std::memory_order_relaxed);
-		Node* temp_tail = m_tail.load(std::memory_order_relaxed);
-		m_head.store(other.m_head.load(std::memory_order_relaxed), std::memory_order_relaxed);
-		m_tail.store(other.m_tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
-		other.m_head.store(temp_head, std::memory_order_relaxed);
-		other.m_tail.store(temp_tail, std::memory_order_relaxed);
-	}
+    template <typename Callback>
+    void ForEach(Callback&& callback) const
+    {
+        // 跳过 dummy 节点
+        Node* current = m_head.load(std::memory_order_acquire);
+        if (current) current = current->next.load(std::memory_order_acquire);
+
+        for (; current != nullptr; current = current->next.load(std::memory_order_acquire))
+        {
+            std::forward<Callback>(callback)(current->observer);
+        }
+    }
+
+    void Clear() noexcept
+    {
+        // 保留 dummy，只清除数据节点
+        Node* dummy = m_head.load(std::memory_order_relaxed);
+        Node* current = dummy ? dummy->next.load(std::memory_order_relaxed) : nullptr;
+
+        while (current != nullptr)
+        {
+            Node* next = current->next.load(std::memory_order_relaxed);
+            delete current;
+            current = next;
+        }
+
+        if (dummy)
+        {
+            dummy->next.store(nullptr, std::memory_order_relaxed);
+            // 重置 tail 到 dummy
+            m_tail.store(dummy, std::memory_order_relaxed);
+        }
+    }
+
+    void Swap(ObserverList& other) noexcept
+    {
+        // 简单交换两个原子指针（注意它们都持有 dummy）
+        Node* tmp_head = m_head.load(std::memory_order_relaxed);
+        Node* tmp_tail = m_tail.load(std::memory_order_relaxed);
+        m_head.store(other.m_head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_tail.store(other.m_tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        other.m_head.store(tmp_head, std::memory_order_relaxed);
+        other.m_tail.store(tmp_tail, std::memory_order_relaxed);
+    }
 
 private:
-	void AppendNode(Node* node) noexcept
-	{
-		Node* new_node = node;
-		new_node->next.store(nullptr, std::memory_order_relaxed);
+    void AppendNode(Node* node) noexcept
+    {
+        node->next.store(nullptr, std::memory_order_relaxed);
 
-		/* Michael-Scott 算法 */
-		while(true)
-		{
-			Node* tail = m_tail.load(std::memory_order_relaxed);
-			Node* next = tail->next.load(std::memory_order_acquire);
+        while (true)
+        {
+            Node* tail = m_tail.load(std::memory_order_acquire);
+            Node* next = tail->next.load(std::memory_order_acquire);
 
-			if(tail == m_tail.load(std::memory_order_acquire))
-			{
-				if(next == nullptr)
-				{
-					if(tail->next.compare_exchange_weak(
-						next, 
-						new_node, 
-						std::memory_order_release, 
-						std::memory_order_relaxed))
-					{
-						m_tail.compare_exchange_strong(
-							tail, 
-							new_node, 
-							std::memory_order_release,
-							std::memory_order_relaxed);
-						return;
-					}
-				}
-				else
-				{
-					m_tail.compare_exchange_weak(
-						tail, 
-						next, 
-						std::memory_order_release, 
-						std::memory_order_relaxed);
-				}
-			}
-		}
-	}
+            if (tail == m_tail.load(std::memory_order_acquire))
+            {
+                if (next == nullptr)
+                {
+                    if (tail->next.compare_exchange_weak(
+                            next, node,
+                            std::memory_order_release,
+                            std::memory_order_relaxed))
+                    {
+                        m_tail.compare_exchange_strong(tail, node,
+                                                       std::memory_order_release,
+                                                       std::memory_order_relaxed);
+                        return;
+                    }
+                }
+                else
+                {
+                    m_tail.compare_exchange_weak(tail, next,
+                                                 std::memory_order_release,
+                                                 std::memory_order_relaxed);
+                }
+            }
+        }
+    }
 
-	std::atomic<Node*> m_head = nullptr;
-	std::atomic<Node*> m_tail = nullptr;
+    std::atomic<Node*> m_head{nullptr};
+    std::atomic<Node*> m_tail{nullptr};
 };
 
 }  // namespace details
 
 template <typename Ty>
-class Observable
+class Observed
 	: private details::Value_Storage<Ty>
 	, private details::SMF_Controll<Ty>
 {
@@ -328,41 +364,41 @@ public:
 	using storage_type = details::Value_Storage<Ty>;
 	using observer_storage_type = details::ObserverList<oberver_type>;
 
-	constexpr Observable() = default;
-	constexpr ~Observable() = default;
-	constexpr Observable(const Observable& other)
+	Observed() = default;
+	~Observed() = default;
+	Observed(const Observed& other)
 		requires std::copy_constructible<Ty>
 		: storage_type(std::in_place, other.Value())
 	{
 	}
 
-	Observable(const Observable& other)
+	Observed(const Observed& other)
 		requires (!std::copy_constructible<Ty>) = delete;
 
-	constexpr Observable(Observable&& other)
+	Observed(Observed&& other)
 		noexcept(std::is_nothrow_move_constructible_v<Ty>)
 		requires std::move_constructible<Ty>
 		: storage_type(std::in_place, std::move(other.Value()))
 	{
 	}
 
-	Observable(Observable&& other)
+	Observed(Observed&& other)
 		requires (!std::move_constructible<Ty>) = delete;
 
-	constexpr Observable(const Ty& initial_value) : storage_type(std::in_place, initial_value) 
+	Observed(const Ty& initial_value) : storage_type(std::in_place, initial_value) 
 	{
 	}
-	constexpr Observable(Ty&& initial_value) : storage_type(std::in_place, std::move(initial_value)) 
+	Observed(Ty&& initial_value) : storage_type(std::in_place, std::move(initial_value)) 
 	{
 	}
 	template <typename... Args>
 		requires std::constructible_from<Ty, Args...>
-	constexpr Observable(std::in_place_t, Args&&... args)
+	Observed(std::in_place_t, Args&&... args)
 		: storage_type(std::in_place, std::forward<Args>(args)...)
 	{
 	}
 
-	constexpr Observable& operator=(const Observable& other)
+	Observed& operator=(const Observed& other)
 		requires (std::copy_constructible<Ty> && std::is_copy_assignable_v<Ty>)
 	{
 		if (this == &other)
@@ -375,10 +411,10 @@ public:
 		return *this;
 	}
 
-	Observable& operator=(const Observable& other)
+	Observed& operator=(const Observed& other)
 		requires (!(std::copy_constructible<Ty> && std::is_copy_assignable_v<Ty>)) = delete;
 
-	constexpr Observable& operator=(Observable&& other)
+	Observed& operator=(Observed&& other)
 		noexcept(std::is_nothrow_move_assignable_v<Ty>)
 		requires (std::move_constructible<Ty> && std::is_move_assignable_v<Ty>)
 	{
@@ -392,15 +428,15 @@ public:
 		return *this;
 	}
 
-	Observable& operator=(Observable&& other)
+	Observed& operator=(Observed&& other)
 		requires (!(std::move_constructible<Ty> && std::is_move_assignable_v<Ty>)) = delete;
 
-	constexpr Observable& operator=(const Ty& new_value)
+	Observed& operator=(const Ty& new_value)
 	{
 		return SetValue(new_value);
 	}
 
-	constexpr Observable& operator=(Ty&& new_value)
+	Observed& operator=(Ty&& new_value)
 	{
 		if constexpr (std::is_move_assignable_v<Ty>)
 		{
@@ -412,19 +448,19 @@ public:
 		}
 	}
 
-	Observable& Subscribe(const oberver_type& observer)
+	Observed& Subscribe(const oberver_type& observer)
 	{
 		m_observers.PushBack(observer);
 		return *this;
 	}
 
-	Observable& Subscribe(oberver_type&& observer)
+	Observed& Subscribe(oberver_type&& observer)
 	{
 		m_observers.PushBack(std::move(observer));
 		return *this;
 	}
 
-	constexpr Observable& SetValue(const Ty& new_value)
+	Observed& SetValue(const Ty& new_value)
 	{
 		this->Assign(new_value);
 		if (!std::is_constant_evaluated())
@@ -434,7 +470,7 @@ public:
 		return *this;
 	}
 
-	constexpr Observable& SetValue(Ty&& new_value)
+	Observed& SetValue(Ty&& new_value)
 	{
 		this->Assign(std::move(new_value));
 		if (!std::is_constant_evaluated())
@@ -446,7 +482,7 @@ public:
 
 	template <typename Fn, typename... Args>
 		requires std::invocable<Fn, Ty&, Args...>
-	constexpr Observable& Modify(Fn&& modify, Args&&... args)
+	Observed& Modify(Fn&& modify, Args&&... args)
 		noexcept(std::is_nothrow_invocable_v<Fn, Ty&, Args...>)
 	{
 		std::invoke(
@@ -463,7 +499,7 @@ public:
 
 	template <typename Fn, typename... Args>
 		requires std::invocable<Fn, Ty&, Args...>
-	static constexpr void Modify(Fn&& modify, Observable& observable, Args&&... args)
+	static void Modify(Fn&& modify, Observed& observable, Args&&... args)
 		noexcept(std::is_nothrow_invocable_v<Fn, Ty&, Args...>)
 	{
 		std::invoke(
@@ -477,12 +513,12 @@ public:
 		}
 	}
 
-	[[nodiscard]] constexpr const Ty& GetValue() const
+	[[nodiscard]] const Ty& GetValue() const
 	{
 		return this->Value();
 	}
 
-	[[nodiscard]] constexpr bool HasValue() const noexcept
+	[[nodiscard]] bool HasValue() const noexcept
 	{
 		return storage_type::HasValue();
 	}
@@ -497,5 +533,6 @@ private:
 
 	observer_storage_type m_observers;
 };
+
 
 }  // namespace ptd
