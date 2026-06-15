@@ -1,55 +1,55 @@
 file(
 	GLOB_RECURSE POTATO_STANDARD_PUBLIC_HEADERS
 	CONFIGURE_DEPENDS
-	"${CMAKE_CURRENT_SOURCE_DIR}/Include/*.h"
-	"${CMAKE_CURRENT_SOURCE_DIR}/Include/*.hh"
-	"${CMAKE_CURRENT_SOURCE_DIR}/Include/*.hpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/Include/*.hxx"
-	"${CMAKE_CURRENT_SOURCE_DIR}/Include/*.inl"
-	"${CMAKE_CURRENT_SOURCE_DIR}/Include/*.ipp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/*.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/*.hh"
+	"${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/*.hxx"
+	"${CMAKE_CURRENT_SOURCE_DIR}/*.inl"
+	"${CMAKE_CURRENT_SOURCE_DIR}/*.ipp"
 )
 
 file(
 	GLOB_RECURSE POTATO_STANDARD_SOURCES
 	CONFIGURE_DEPENDS
-	"${CMAKE_CURRENT_SOURCE_DIR}/Source/*.c"
-	"${CMAKE_CURRENT_SOURCE_DIR}/Source/*.cc"
-	"${CMAKE_CURRENT_SOURCE_DIR}/Source/*.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/Source/*.cxx"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.cxx"
 )
 
 
 if(POTATO_STANDARD_SOURCES)
-	add_library(PotatoStandard)
+	add_library(Core)
 	set(POTATO_STANDARD_USAGE_SCOPE PUBLIC)
 
 	if(POTATO_STANDARD_SOURCES)
-		target_sources(PotatoStandard PRIVATE ${POTATO_STANDARD_SOURCES})
+		target_sources(Core PRIVATE ${POTATO_STANDARD_SOURCES})
 	endif()
 else()
-	add_library(PotatoStandard INTERFACE)
+	add_library(Core INTERFACE)
 	set(POTATO_STANDARD_USAGE_SCOPE INTERFACE)
 endif()
 
-add_library(PotatoStandard::PotatoStandard ALIAS PotatoStandard)
+add_library(Core::Core ALIAS Core)
 
-target_compile_features(PotatoStandard ${POTATO_STANDARD_USAGE_SCOPE} cxx_std_23)
+target_compile_features(Core ${POTATO_STANDARD_USAGE_SCOPE} cxx_std_23)
 target_include_directories(
-	PotatoStandard
+	Core
 	${POTATO_STANDARD_USAGE_SCOPE}
 		$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Include>
 		$<INSTALL_INTERFACE:include>
 )
 
 set_target_properties(
-	PotatoStandard
+	Core
 	PROPERTIES
-		EXPORT_NAME PotatoStandard
+		EXPORT_NAME Core
 )
 
 if(NOT CMAKE_VERSION VERSION_LESS 3.23 AND POTATO_STANDARD_PUBLIC_HEADERS)
 	target_sources(
-		PotatoStandard
+		Core
 		${POTATO_STANDARD_USAGE_SCOPE}
 			FILE_SET HEADERS
 			BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/Include
@@ -57,7 +57,7 @@ if(NOT CMAKE_VERSION VERSION_LESS 3.23 AND POTATO_STANDARD_PUBLIC_HEADERS)
 	)
 endif()
 
-set(POTATO_STANDARD_INSTALL_ARGS EXPORT PotatoStandardTargets)
+set(POTATO_STANDARD_INSTALL_ARGS EXPORT CoreTargets)
 
 if(NOT CMAKE_VERSION VERSION_LESS 3.23 AND POTATO_STANDARD_PUBLIC_HEADERS)
 	list(APPEND POTATO_STANDARD_INSTALL_ARGS FILE_SET HEADERS DESTINATION include)
@@ -69,12 +69,12 @@ else()
 endif()
 
 install(
-	TARGETS PotatoStandard
+	TARGETS Core
 	${POTATO_STANDARD_INSTALL_ARGS}
 )
 
 install(
-	EXPORT PotatoStandardTargets
-	NAMESPACE PotatoStandard::
-	DESTINATION lib/cmake/PotatoStandard
+	EXPORT CoreTargets
+	NAMESPACE Core::
+	DESTINATION lib/cmake/Core
 )
