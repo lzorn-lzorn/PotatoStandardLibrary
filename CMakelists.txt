@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(POTATO_STANDARD_BUILD_TESTS "Build tests under Test/." ${PROJECT_IS_TOP_LEVEL})
 
-add_subdirectory(PotatoStandard)
+add_subdirectory(Core)
 
 if(POTATO_STANDARD_BUILD_TESTS)
 	include(CTest)

@@ -34,7 +34,7 @@ The root [CMakeLists.txt](CMakeLists.txt) is responsible for:
 
 ### Library module
 
-The [PotatoStandard/CMakelists.txt](PotatoStandard/CMakelists.txt) file is the library module entry point. It:
+The [PotatoStandard/CMakelists.txt](Core/CMakelists.txt) file is the library module entry point. It:
 
 - discovers public headers under `PotatoStandard/Include/`;
 - discovers optional implementation sources under `PotatoStandard/Source/`;
@@ -115,7 +115,7 @@ In the current environment, `Ninja` is listed by CMake but the executable is not
 
 ### 3. Add or update a library module
 
-Public API should go under `PotatoStandard/Include/`. For example, the current smoke-testable API lives in [PotatoStandard/Include/PotatoStandard/Version.hpp](PotatoStandard/Include/PotatoStandard/Version.hpp).
+Public API should go under `PotatoStandard/Include/`. For example, the current smoke-testable API lives in [PotatoStandard/Include/PotatoStandard/Version.hpp](Core/Include/PotatoStandard/Version.hpp).
 
 If you later add compiled sources, place them under `PotatoStandard/Source/`. The existing library CMake file already discovers them automatically.
 
@@ -173,7 +173,7 @@ The install step exports `PotatoStandard::PotatoStandard` for downstream consume
 
 ## Current smoke test
 
-The current smoke test validates the minimal public API in [PotatoStandard/Include/PotatoStandard/Version.hpp](PotatoStandard/Include/PotatoStandard/Version.hpp) by checking:
+The current smoke test validates the minimal public API in [PotatoStandard/Include/PotatoStandard/Version.hpp](Core/Include/PotatoStandard/Version.hpp) by checking:
 
 - the exported library semantic version constants;
 - the combined `VersionValue()` helper.
