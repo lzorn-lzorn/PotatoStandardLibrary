@@ -1714,9 +1714,16 @@ struct TMatrix <Ty, N, N>
 	TMatrix <Ty, N, N>& operator-=(Ty rhs) noexcept;
 
 	TMatrix <Ty, N, N>& multiply(const TMatrix <Ty, N, N>& rhs) noexcept;
+
 	bool inverse() noexcept;
 	double det() const noexcept; 
 };
+
+template <typename Ty, size_t N>
+[[nodiscard]] constexpr static vec<Ty, N> operator*(const TMatrix <Ty, N, N>& mat, const vec<Ty, N>& vec) noexcept;
+template <typename Ty, size_t N>
+[[nodiscard]] constexpr static vec<Ty, N> operator*(const vec<Ty, N>& vec, const TMatrix <Ty, N, N>& mat) noexcept;
+
 template <typename Ty, size_t N>
 constexpr static TMatrix <Ty, N, N> perspective(Ty fov, Ty aspect, Ty near, Ty far) noexcept;
 
