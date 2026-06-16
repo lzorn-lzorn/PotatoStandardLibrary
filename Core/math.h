@@ -1698,26 +1698,130 @@ template <typename Ty, size_t N>
 struct TMatrix <Ty, N, N>
 {
 	using value_type = Ty;
-
+	using self_type = TMatrix<Ty, N, N>;
 	constexpr static size_t rows = N;
 	constexpr static size_t cols = N;
 
 	Ty m[N][N];
 
-	constexpr static TMatrix <Ty, N, N> identity() noexcept;
-	constexpr static TMatrix <Ty, N, N> zero() noexcept;
-	constexpr static TMatrix <Ty, N, N> one() noexcept;
+	constexpr static self_type identity() noexcept;
+	constexpr static self_type zero() noexcept;
+	constexpr static self_type one() noexcept;
 
-	TMatrix <Ty, N, N>& operator+=(const TMatrix <Ty, N, N>& rhs) noexcept;
-	TMatrix <Ty, N, N>& operator+=(Ty rhs) noexcept;
+	self_type& operator+=(const self_type& rhs) noexcept;
+	self_type& operator+=(Ty rhs) noexcept;
 	TMatrix <Ty, N, N>& operator-=(const TMatrix <Ty, N, N>& rhs) noexcept;
 	TMatrix <Ty, N, N>& operator-=(Ty rhs) noexcept;
 
-	TMatrix <Ty, N, N>& multiply(const TMatrix <Ty, N, N>& rhs) noexcept;
+	TMatrix <Ty, N, N>& multiply(const TMatrix <Ty, N, N>& rhs) noexcept
+	{
+		TMatrix <Ty, N, N> result = zero();
+	#if defined(__SSE2__)
+		if constexpr (std::is_same_v<Ty, float> && N == 4)
+		{
+			__m128 a0 = _mm_loadu_ps(&m[0][0]);
+			__m128 a1 = _mm_loadu_ps(&m[1][0]);
+			__m128 a2 = _mm_loadu_ps(&m[2][0]);
+			__m128 a3 = _mm_loadu_ps(&m[3][0]);
+			__m128 b0 = _mm_loadu_ps(&rhs.m[0][0]);
+			__m128 b1 = _mm_loadu_ps(&rhs.m[1][0]);
+			__m128 b2 = _mm_loadu_ps(&rhs.m[2][0]);
+			__m128 b3 = _mm_loadu_ps(&rhs.m[3][0]);
 
+			/// 矩阵A的第r行
+			/// C[r] = ai[0] * B[0] + ai[1] * B[1] + ai[2] * B[2] + ai[3] * B[3]
+			auto row = [&](__m128 ai, size_t r) {
+				/**
+				 * 0x00 = [00, 00, 00, 00] -> [a[0], a[0], a[0], a[0]]
+				 * 0x55 = [01, 01, 01, 01] -> [a[1], a[1], a[1], a[1]]
+				 * 0xAA = [10, 10, 10, 10] -> [a[2], a[2], a[2], a[2]]
+				 * 0xFF = [11, 11, 11, 11] -> [a[3], a[3], a[3], a[3]]
+				 */
+				__m128 t0 = _mm_mul_ps(_mm_shuffle_ps(ai, ai, 0x00), b0);
+				__m128 t1 = _mm_mul_ps(_mm_shuffle_ps(ai, ai, 0x55), b1);
+				__m128 t2 = _mm_mul_ps(_mm_shuffle_ps(ai, ai, 0xAA), b2);
+				__m128 t3 = _mm_mul_ps(_mm_shuffle_ps(ai, ai, 0xFF), b3);
+				__m128 sum = _mm_add_ps(_mm_add_ps(t0, t1), _mm_add_ps(t2, t3));
+				_mm_storeu_ps(&result.m[r][0], sum);
+			};
+
+			row(a0, 0);
+			row(a1, 1);
+			row(a2, 2);
+			row(a3, 3);
+		}
+	#else
+		if constexpr (N == 4)
+		{
+			result.m[0][0] = m[0][0] * rhs.m[0][0] + m[0][1] * rhs.m[1][0] + m[0][2] * rhs.m[2][0] + m[0][3] * rhs.m[3][0];
+			result.m[0][1] = m[0][0] * rhs.m[0][1] + m[0][1] * rhs.m[1][1] + m[0][2] * rhs.m[2][1] + m[0][3] * rhs.m[3][1];
+			result.m[0][2] = m[0][0] * rhs.m[0][2] + m[0][1] * rhs.m[1][2] + m[0][2] * rhs.m[2][2] + m[0][3] * rhs.m[3][2];
+			result.m[0][3] = m[0][0] * rhs.m[0][3] + m[0][1] * rhs.m[1][3] + m[0][2] * rhs.m[2][3] + m[0][3] * rhs.m[3][3];
+			result.m[1][0] = m[1][0] * rhs.m[0][0] + m[1][1] * rhs.m[1][0] + m[1][2] * rhs.m[2][0] + m[1][3] * rhs.m[3][0];
+			result.m[1][1] = m[1][0] * rhs.m[0][1] + m[1][1] * rhs.m[1][1] + m[1][2] * rhs.m[2][1] + m[1][3] * rhs.m[3][1];
+			result.m[1][2] = m[1][0] * rhs.m[0][2] + m[1][1] * rhs.m[1][2] + m[1][2] * rhs.m[2][2] + m[1][3] * rhs.m[3][2];
+			result.m[1][3] = m[1][0] * rhs.m[0][3] + m[1][1] * rhs.m[1][3] + m[1][2] * rhs.m[2][3] + m[1][3] * rhs.m[3][3];
+			result.m[2][0] = m[2][0] * rhs.m[0][0] + m[2][1] * rhs.m[1][0] + m[2][2] * rhs.m[2][0] + m[2][3] * rhs.m[3][0];
+			result.m[2][1] = m[2][0] * rhs.m[0][1] + m[2][1] * rhs.m[1][1] + m[2][2] * rhs.m[2][1] + m[2][3] * rhs.m[3][1];
+			result.m[2][2] = m[2][0] * rhs.m[0][2] + m[2][1] * rhs.m[1][2] + m[2][2] * rhs.m[2][2] + m[2][3] * rhs.m[3][2];
+			result.m[2][3] = m[2][0] * rhs.m[0][3] + m[2][1] * rhs.m[1][3] + m[2][2] * rhs.m[2][3] + m[2][3] * rhs.m[3][3];
+			result.m[3][0] = m[3][0] * rhs.m[0][0] + m[3][1] * rhs.m[1][0] + m[3][2] * rhs.m[2][0] + m[3][3] * rhs.m[3][0];
+			result.m[3][1] = m[3][0] * rhs.m[0][1] + m[3][1] * rhs.m[1][1] + m[3][2] * rhs.m[2][1] + m[3][3] * rhs.m[3][1];
+			result.m[3][2] = m[3][0] * rhs.m[0][2] + m[3][1] * rhs.m[1][2] + m[3][2] * rhs.m[2][2] + m[3][3] * rhs.m[3][2];
+			result.m[3][3] = m[3][0] * rhs.m[0][3] + m[3][1] * rhs.m[1][3] + m[3][2] * rhs.m[2][3] + m[3][3] * rhs.m[3][3];
+		}
+		else if constexpr (N == 3)
+		{
+			result.m[0][0] = m[0][0]*rhs.m[0][0] + m[0][1]*rhs.m[1][0] + m[0][2]*rhs.m[2][0];
+			result.m[0][1] = m[0][0]*rhs.m[0][1] + m[0][1]*rhs.m[1][1] + m[0][2]*rhs.m[2][1];
+			result.m[0][2] = m[0][0]*rhs.m[0][2] + m[0][1]*rhs.m[1][2] + m[0][2]*rhs.m[2][2];
+
+			result.m[1][0] = m[1][0]*rhs.m[0][0] + m[1][1]*rhs.m[1][0] + m[1][2]*rhs.m[2][0];
+			result.m[1][1] = m[1][0]*rhs.m[0][1] + m[1][1]*rhs.m[1][1] + m[1][2]*rhs.m[2][1];
+			result.m[1][2] = m[1][0]*rhs.m[0][2] + m[1][1]*rhs.m[1][2] + m[1][2]*rhs.m[2][2];
+
+			result.m[2][0] = m[2][0]*rhs.m[0][0] + m[2][1]*rhs.m[1][0] + m[2][2]*rhs.m[2][0];
+			result.m[2][1] = m[2][0]*rhs.m[0][1] + m[2][1]*rhs.m[1][1] + m[2][2]*rhs.m[2][1];
+			result.m[2][2] = m[2][0]*rhs.m[0][2] + m[2][1]*rhs.m[1][2] + m[2][2]*rhs.m[2][2];
+		}
+		else if constexpr (N == 2)
+		{
+			result.m[0][0] = m[0][0]*rhs.m[0][0] + m[0][1]*rhs.m[1][0];
+            result.m[0][1] = m[0][0]*rhs.m[0][1] + m[0][1]*rhs.m[1][1];
+            result.m[1][0] = m[1][0]*rhs.m[0][0] + m[1][1]*rhs.m[1][0];
+            result.m[1][1] = m[1][0]*rhs.m[0][1] + m[1][1]*rhs.m[1][1];
+		}
+		else if constexpr (N == 1)
+		{
+			result.m[0][0] = m[0][0] * rhs.m[0][0];
+		}
+		else
+		{	
+			for (size_t i = 0; i < N; ++i) {
+				for (size_t k = 0; k < N; ++k) {
+					for (size_t j = 0; j < N; ++j) {
+						result.m[i][j] += mat1.m[i][k] * mat2.m[k][j];
+					}
+				}
+			}
+		}
+	#endif
+		*this = result;
+		return *this;
+	}
+	self_type& transpositive() noexcept;
 	bool inverse() noexcept;
-	double det() const noexcept; 
+	double det() const noexcept; 	
 };
+
+template <typename Ty, size_t N>
+TMatrix <Ty, N, N> native_multiply(const TMatrix <Ty, N, N>& mat1, const TMatrix <Ty, N, N>& mat2) noexcept
+{
+	TMatrix <Ty, N, N> result = zero();
+	
+	return result;
+}
+
 
 template <typename Ty, size_t N>
 [[nodiscard]] constexpr static vec<Ty, N> operator*(const TMatrix <Ty, N, N>& mat, const vec<Ty, N>& vec) noexcept;
