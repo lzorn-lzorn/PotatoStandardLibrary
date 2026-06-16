@@ -15,6 +15,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <execution>
 #include <iomanip>
 #include <type_traits>
 #include <charconv>
@@ -1695,6 +1696,7 @@ struct TMatrix
 };
 
 template <typename Ty, size_t N>
+	requires std::is_arithmetic_v<Ty>
 struct TMatrix <Ty, N, N>
 {
 	using value_type = Ty;
@@ -1702,16 +1704,53 @@ struct TMatrix <Ty, N, N>
 	constexpr static size_t rows = N;
 	constexpr static size_t cols = N;
 
-	Ty m[N][N];
+	alignas(16) std::array<std::array<Ty, N>, N> m {};
 
-	constexpr static self_type identity() noexcept;
-	constexpr static self_type zero() noexcept;
-	constexpr static self_type one() noexcept;
-
-	self_type& operator+=(const self_type& rhs) noexcept;
-	self_type& operator+=(Ty rhs) noexcept;
-	TMatrix <Ty, N, N>& operator-=(const TMatrix <Ty, N, N>& rhs) noexcept;
-	TMatrix <Ty, N, N>& operator-=(Ty rhs) noexcept;
+	constexpr static self_type identity() noexcept
+	{
+		self_type result = zero();
+		for (size_t i = 0; i < N; ++i) 
+		{
+			result.m[i][i] = static_cast<Ty>(1);
+		}
+		return result;
+	}
+	constexpr static self_type zero() noexcept
+	{
+		return self_type{};
+	}
+	constexpr static self_type one() noexcept {
+		return fill(1);
+	}
+	static self_type fill(self_type& mat, Ty value) noexcept {
+		for (auto& row : mat.m) 
+		{
+			std::fill(row.begin(), row.end(), value);
+		}
+		return mat;
+	}
+	self_type& fill_with(Ty value) noexcept
+	{
+		return fill(*this, value);
+	}
+	self_type& operator+=(const self_type& rhs) noexcept {
+		std::transform(&m[0][0], &m[0][0] + N*N, &rhs.m[0][0], &m[0][0], std::plus<>{});
+		return *this;
+	}
+	self_type& operator+=(Ty rhs) noexcept {
+		std::for_each(&m[0][0], &m[0][0] + N*N, [rhs](Ty& v){ v += rhs; });
+		return *this;
+	}
+	TMatrix <Ty, N, N>& operator-=(const TMatrix <Ty, N, N>& rhs) noexcept
+	{
+		std::transform(&m[0][0], &m[0][0] + N*N, &rhs.m[0][0], &m[0][0], std::minus<>{});
+		return *this;
+	}
+	TMatrix <Ty, N, N>& operator-=(Ty rhs) noexcept
+	{
+		std::for_each(&m[0][0], &m[0][0] + N*N, [rhs](Ty& v){ v -= rhs; });
+		return *this;
+	}
 
 	TMatrix <Ty, N, N>& multiply(const TMatrix <Ty, N, N>& rhs) noexcept
 	{
@@ -1749,8 +1788,50 @@ struct TMatrix <Ty, N, N>
 			row(a1, 1);
 			row(a2, 2);
 			row(a3, 3);
+			*this = result;
+			return *this;
 		}
+		else 
+		{
+			return native_multiply(rhs);
+		}
+		
 	#else
+		return native_multiply(rhs);
+	#endif
+		
+		
+	}
+	self_type& transpositive() noexcept
+	{
+	#if defined(__SSE2__)
+		if constexpr (std::is_same_v<Ty, float> && N == 4)
+		{
+			__m128 row0 = _mm_loadu_ps(&m[0][0]);
+			__m128 row1 = _mm_loadu_ps(&m[1][0]);
+			__m128 row2 = _mm_loadu_ps(&m[2][0]);
+			__m128 row3 = _mm_loadu_ps(&m[3][0]);
+
+			_MM_TRANSPOSE4_PS(row0, row1, row2, row3);
+
+			_mm_storeu_ps(&m[0][0], row0);
+			_mm_storeu_ps(&m[1][0], row1);
+			_mm_storeu_ps(&m[2][0], row2);
+			_mm_storeu_ps(&m[3][0], row3);
+		}
+		else
+		{
+			return native_transpose();
+		}
+	#endif
+		return native_transpose();
+	}
+	bool inverse() noexcept;
+	double det() const noexcept; 	
+private:
+	self_type& native_multiply(const self_type& rhs) noexcept
+	{
+		TMatrix <Ty, N, N> result = zero();
 		if constexpr (N == 4)
 		{
 			result.m[0][0] = m[0][0] * rhs.m[0][0] + m[0][1] * rhs.m[1][0] + m[0][2] * rhs.m[2][0] + m[0][3] * rhs.m[3][0];
@@ -1800,18 +1881,49 @@ struct TMatrix <Ty, N, N>
 			for (size_t i = 0; i < N; ++i) {
 				for (size_t k = 0; k < N; ++k) {
 					for (size_t j = 0; j < N; ++j) {
-						result.m[i][j] += mat1.m[i][k] * mat2.m[k][j];
+						result.m[i][j] += m[i][k] * rhs.m[k][j];
 					}
 				}
 			}
 		}
-	#endif
 		*this = result;
 		return *this;
 	}
-	self_type& transpositive() noexcept;
-	bool inverse() noexcept;
-	double det() const noexcept; 	
+	self_type& native_transpositive() noexcept
+	{
+		if constexpr (N == 1)
+		{
+			return *this;
+		}
+		else if constexpr (N == 2)
+		{
+			std::swap(m[0][1], m[1][0]);
+		}
+		else if constexpr (N == 3)
+		{
+			std::swap(m[0][1], m[1][0]);
+			std::swap(m[0][2], m[2][0]);
+			std::swap(m[1][2], m[2][1]);
+		}
+		else if constexpr (N == 4)
+		{
+			std::swap(m[0][1], m[1][0]);
+			std::swap(m[0][2], m[2][0]);
+			std::swap(m[0][3], m[3][0]);
+			std::swap(m[1][2], m[2][1]);
+			std::swap(m[1][3], m[3][1]);
+			std::swap(m[2][3], m[3][2]);
+		}
+		else
+		{
+			for (size_t i = 0; i < N; ++i) {
+				for (size_t j = i + 1; j < N; ++j) {
+					std::swap(m[i][j], m[j][i]);
+				}
+			}
+		}
+		return *this;
+	}
 };
 
 template <typename Ty, size_t N>
