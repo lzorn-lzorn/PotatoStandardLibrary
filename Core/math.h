@@ -1,6 +1,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cmath>
 #include <array>
 #include <limits>
@@ -17,6 +18,13 @@
 #include <iomanip>
 #include <type_traits>
 #include <charconv>
+
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 
 namespace core::math
 {
@@ -74,9 +82,9 @@ namespace details
  *  [[nodiscard]] std::size_t NewFunctionForIntegral() const noexcept { ... }
  */
 template <class Derived>
-struct Vector_Implementation 
+struct TVector 
 {
-	using traits		 = vector_traits<Derived>;
+	using traits		  = vector_traits<Derived>;
     using value_type      = typename traits::value_type;
     using reference       = value_type&;
     using const_reference = const value_type&;
@@ -137,8 +145,8 @@ public:
     constexpr Derived&       derived()       noexcept { return static_cast<Derived&>(*this); }
     constexpr const Derived& derived() const noexcept { return static_cast<const Derived&>(*this); }
 
-    constexpr Vector_Implementation() = default;
-    explicit constexpr Vector_Implementation(value_type value) 
+    constexpr TVector() = default;
+    explicit constexpr TVector(value_type value) 
     {
         ForEachIndex([&](std::size_t index) {
             coordinates[index] = value;
@@ -147,7 +155,7 @@ public:
 
     template <typename U>
         requires std::convertible_to<U, value_type>
-    constexpr Vector_Implementation(const std::array<U, dimensions>& values)
+    constexpr TVector(const std::array<U, dimensions>& values)
     {
         ForEachIndex([&](std::size_t index) {
             coordinates[index] = static_cast<value_type>(values[index]);
@@ -156,7 +164,7 @@ public:
 
     template <typename U>
         requires std::convertible_to<U, value_type>
-    constexpr Vector_Implementation(const U (&values)[dimensions])
+    constexpr TVector(const U (&values)[dimensions])
     {
         ForEachIndex([&](std::size_t index) {
             coordinates[index] = static_cast<value_type>(values[index]);
@@ -166,7 +174,7 @@ public:
     template <typename... Args>
         requires (sizeof...(Args) == dimensions) &&
                  (std::conjunction_v<std::is_convertible<Args, value_type>...>)
-    constexpr Vector_Implementation(Args&&... args) 
+    constexpr TVector(Args&&... args) 
     {
         std::size_t i = 0;
         ((coordinates[i++] = static_cast<value_type>(std::forward<Args>(args))), ...);
@@ -325,6 +333,29 @@ public:
         return derived();
     }
 
+	static constexpr Derived normalize(const Derived& v, const Derived& fallback = Derived{})
+		requires std::is_floating_point_v<typename traits::value_type>
+	{
+		auto len = v.length();
+		if (len == value_type(0)){
+			return fallback;
+		}
+		return v / static_cast<value_type>(len);
+	}
+
+	static constexpr Derived lerp(const Derived& a, const Derived& b, value_type t) noexcept {
+		return a + (b - a) * t;
+	}
+
+	static constexpr Derived clamp_len(const Derived& v, value_type max_len)
+		requires std::is_floating_point_v<value_type>
+	{
+		auto lenSq = v.square();
+		if (lenSq > max_len * max_len)
+			return v * (max_len / std::sqrt(lenSq));
+		return v;
+	}
+
 	constexpr auto as_tuple() const noexcept
 	{
 		return std::apply([](auto&&... args) {
@@ -332,11 +363,13 @@ public:
 		}, coordinates);
 	}
 };
+
+
 } // namespace core::math::details end
 
 template <arithmetic Ty, std::size_t Dimensions>
-struct vec : details::Vector_Implementation<vec<Ty, Dimensions>> {
-    using base            = details::Vector_Implementation<vec<Ty, Dimensions>>;
+struct vec : details::TVector<vec<Ty, Dimensions>> {
+    using base            = details::TVector<vec<Ty, Dimensions>>;
 	using value_type      = Ty;
 	using reference       = typename base::reference;
     using const_reference = typename base::const_reference;
@@ -373,9 +406,9 @@ template <arithmetic Ty, std::size_t N>
 vec(const Ty (&)[N]) -> vec<Ty, N>;
 
 template <arithmetic Ty>
-struct vec<Ty, 2> : details::Vector_Implementation<vec<Ty, 2>> 
+struct vec<Ty, 2> : details::TVector<vec<Ty, 2>> 
 {
-    using base = details::Vector_Implementation<vec<Ty, 2>>;
+    using base = details::TVector<vec<Ty, 2>>;
     using value_type      = Ty;
     using reference       = typename base::reference;
     using const_reference = typename base::const_reference;
@@ -404,11 +437,15 @@ struct vec<Ty, 2> : details::Vector_Implementation<vec<Ty, 2>>
     }
     static constexpr vec x_axis() noexcept { return vec{Ty{1}, Ty{0}}; }
     static constexpr vec y_axis() noexcept { return vec{Ty{0}, Ty{1}}; }
+
+	[[nodiscard]] static constexpr Ty cross(const vec& a, const vec& b) noexcept {
+        return a.x() * b.y() - a.y() * b.x();
+    }
 };
 
 template <arithmetic Ty>
-struct vec<Ty, 3> : details::Vector_Implementation<vec<Ty, 3>> {
-    using base = details::Vector_Implementation<vec<Ty, 3>>;
+struct vec<Ty, 3> : details::TVector<vec<Ty, 3>> {
+    using base = details::TVector<vec<Ty, 3>>;
     using value_type      = Ty;
     using reference       = typename base::reference;
     using const_reference = typename base::const_reference;
@@ -446,11 +483,19 @@ struct vec<Ty, 3> : details::Vector_Implementation<vec<Ty, 3>> {
     static constexpr vec backward() noexcept { return vec{Ty{-1}, Ty{0}, Ty{0}}; }
     static constexpr vec left() noexcept { return vec{Ty{0}, Ty{1}, Ty{0}}; }
     static constexpr vec right() noexcept { return vec{Ty{0}, Ty{-1}, Ty{0}}; }
+
+	[[nodiscard]] static constexpr vec cross(const vec& a, const vec& b) noexcept {
+        return vec{
+            a.y() * b.z() - a.z() * b.y(),
+            a.z() * b.x() - a.x() * b.z(),
+            a.x() * b.y() - a.y() * b.x()
+        };
+    }
 };
 
 template <arithmetic Ty>
-struct vec<Ty, 4> : details::Vector_Implementation<vec<Ty, 4>> {
-    using base = details::Vector_Implementation<vec<Ty, 4>>;
+struct vec<Ty, 4> : details::TVector<vec<Ty, 4>> {
+    using base = details::TVector<vec<Ty, 4>>;
     using value_type      = Ty;
     using reference       = typename base::reference;
     using const_reference = typename base::const_reference;
@@ -543,7 +588,7 @@ public:
     explicit constexpr linear_color3d(const linear_color4d& c) noexcept;
 
     [[nodiscard]] constexpr linear_color4d with_alpha(float alpha = 1.0f) const noexcept;
-    // 允许从其他算术类型的 Vector 转换
+    // 允许从其他算术类型的 TVector 转换
     template <typename U>
         requires std::is_arithmetic_v<U>
     explicit constexpr linear_color3d(const vec3d<U>& v) noexcept 
@@ -1038,7 +1083,7 @@ private:
     vector_type m_data;
 };
 
-// ---------- 与 Vector 的互操作（可选） ----------
+// ---------- 与 TVector 的互操作（可选） ----------
 inline vec3d<float> to_vector(const linear_color3d& c) noexcept {
     return c.as_vector();
 }
@@ -1628,7 +1673,89 @@ inline constexpr linear_color4d linear_color3d::with_alpha(float alpha) const no
     return linear_color4d{*this, alpha};
 }
 
-} // namespace core::color ======================================================================================
+} // namespace core::color ================================================================================
+
+namespace core::math
+{
+namespace details
+{
+
+template <typename Ty, size_t Row, size_t Col = Row>
+struct TMatrix;
+
+template <typename Ty, size_t Row, size_t Col>
+struct TMatrix 
+{
+	using value_type = Ty;
+
+	constexpr static size_t rows = Row;
+	constexpr static size_t cols = Col;
+
+	Ty m[Row][Col];
+};
+
+template <typename Ty, size_t N>
+struct TMatrix <Ty, N, N>
+{
+	using value_type = Ty;
+
+	constexpr static size_t rows = N;
+	constexpr static size_t cols = N;
+
+	Ty m[N][N];
+
+	constexpr static TMatrix <Ty, N, N> identity() noexcept;
+	constexpr static TMatrix <Ty, N, N> zero() noexcept;
+	constexpr static TMatrix <Ty, N, N> one() noexcept;
+
+	TMatrix <Ty, N, N>& operator+=(const TMatrix <Ty, N, N>& rhs) noexcept;
+	TMatrix <Ty, N, N>& operator+=(Ty rhs) noexcept;
+	TMatrix <Ty, N, N>& operator-=(const TMatrix <Ty, N, N>& rhs) noexcept;
+	TMatrix <Ty, N, N>& operator-=(Ty rhs) noexcept;
+
+	TMatrix <Ty, N, N>& multiply(const TMatrix <Ty, N, N>& rhs) noexcept;
+	bool inverse() noexcept;
+	double det() const noexcept; 
+};
+template <typename Ty, size_t N>
+constexpr static TMatrix <Ty, N, N> perspective(Ty fov, Ty aspect, Ty near, Ty far) noexcept;
+
+template <typename Ty, size_t N>
+constexpr static TMatrix <Ty, N, N> translate(Ty x, Ty y, Ty z) noexcept;
+
+template <typename Ty, size_t N>
+constexpr static TMatrix <Ty, N, N> rotate(Ty angle, Ty x, Ty y, Ty z) noexcept;
+
+template <typename Ty, size_t N>
+constexpr static TMatrix <Ty, N, N> scale(Ty x, Ty y, Ty z) noexcept;
+
+template <typename Ty, size_t N>
+TMatrix <Ty, N, N> operator+(const TMatrix <Ty, N, N> lhs, const TMatrix <Ty, N, N>& rhs) noexcept;
+template <typename Ty, size_t N>
+TMatrix <Ty, N, N> operator+(Ty lhs, const TMatrix <Ty, N, N>& rhs) noexcept;
+template <typename Ty, size_t N>
+TMatrix <Ty, N, N> operator+(const TMatrix <Ty, N, N> lhs, Ty rhs) noexcept;
+
+template <typename Ty, size_t N>
+TMatrix <Ty, N, N> operator-(const TMatrix <Ty, N, N> lhs, const TMatrix <Ty, N, N>& rhs) noexcept;
+template <typename Ty, size_t N>
+TMatrix <Ty, N, N> operator-(Ty lhs, const TMatrix <Ty, N, N>& rhs) noexcept;
+template <typename Ty, size_t N>
+TMatrix <Ty, N, N> operator-(const TMatrix <Ty, N, N> lhs, Ty rhs) noexcept;
+
+
+}
+
+using mat2i = details::TMatrix<int32_t, 2>;
+using mat2f = details::TMatrix<float, 2>;
+using mat3i = details::TMatrix<int32_t, 3>;
+using mat3f = details::TMatrix<float, 3>;
+using mat4i = details::TMatrix<int32_t, 4>;
+using mat4f = details::TMatrix<float, 4>;
+}
+
+
+
 
 
 
