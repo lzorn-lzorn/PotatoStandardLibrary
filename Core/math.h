@@ -20,9 +20,7 @@
 #include <type_traits>
 #include <charconv>
 
-#if defined(__SSE4_1__)
-#include <smmintrin.h>
-#elif defined(__SSE2__)
+#if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
 
@@ -50,6 +48,40 @@ concept arithmetic = std::integral<Number> || std::floating_point<Number>;
 [[maybe_unused]] static constexpr float deg2rad     = pi / 180.0f;
 [[maybe_unused]] static constexpr float rad2deg     = 180.0f / pi;
 
+
+template<std::floating_point Ty>
+constexpr bool approx_equal(Ty a, Ty b, Ty eps = Ty{0.0001}) noexcept
+{
+    const Ty diff = std::abs(a - b);
+    const Ty scale = std::max(std::abs(a), std::abs(b));
+    return diff <= eps * std::max(scale, Ty{1});
+}
+
+constexpr bool approx_equal(float a, float b, float eps = tiny) noexcept
+{
+    return approx_equal<float>(a, b, eps);
+}
+constexpr bool approx_equal(double a, double b, double eps = tiny) noexcept
+{
+    return approx_equal<double>(a, b, eps);
+}
+constexpr bool approx_equal(long double a, long double b, long double eps = tiny) noexcept
+{
+    return approx_equal<long double>(a, b, eps);
+}
+
+constexpr bool approx_zero(float a, float eps = tiny) noexcept
+{
+	return approx_equal<float>(a, 0.0f, eps);
+}
+constexpr bool approx_zero(double a, double eps = tiny) noexcept
+{
+	return approx_equal<double>(a, 0.0, eps);
+}
+constexpr bool approx_zero(long double a, long double eps = tiny) noexcept
+{
+	return approx_equal<long double>(a, 0.0L, eps);
+}
 }
 
 
@@ -1826,8 +1858,77 @@ struct TMatrix <Ty, N, N>
 	#endif
 		return native_transpose();
 	}
-	bool inverse() noexcept;
-	double det() const noexcept; 	
+	bool inverse() noexcept
+	{
+		return approx_equal(det(), 0.f, 1e-6);
+	}
+	double det() const noexcept
+	{
+		if constexpr (N == 1) 
+		{
+			return m[0][0];
+		}
+		else if constexpr (N == 2)
+		{
+			return m[0][0]*m[1][1] - m[0][1]*m[1][0];
+		}
+		else if constexpr (N == 3)
+		{
+			return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+				 - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+				 + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+		}
+		else if constexpr (N == 4)
+		{
+			float a = m[0][0], b = m[0][1], c = m[0][2], d = m[0][3];
+			float e = m[1][0], f = m[1][1], g = m[1][2], h = m[1][3];
+			float i = m[2][0], j = m[2][1], k = m[2][2], l = m[2][3];
+			float m0 = m[3][0], n = m[3][1], o = m[3][2], p = m[3][3];
+
+			return a * (f * (k * p - l * o) - g * (j * p - l * n) + h * (j * o - k * n))
+				 - b * (e * (k * p - l * o) - g * (i * p - l * m0) + h * (i * o - k * m0))
+				 + c * (e * (j * p - l * n) - f * (i * p - l * m0) + h * (i * n - j * m0))
+				 - d * (e * (j * o - k * n) - f * (i * o - k * m0) + g * (i * n - j * m0));
+			}
+		else
+		{
+			TMatrix<Ty, N, N> A = *this;
+			int parity = 1;  // 符号: 1 为正，-1 为负
+			for (size_t k = 0; k < N; ++k) 
+			{
+				// 部分选主元：找当前列绝对值最大行
+				size_t pivot = k;
+				for (size_t i = k + 1; i < N; ++i)
+				{
+					if (std::abs(A.m[i][k]) > std::abs(A.m[pivot][k]))
+					{
+						pivot = i;
+					}
+				}
+				if (pivot != k) 
+				{
+					std::swap(A.m[k], A.m[pivot]);
+					parity = -parity;
+				}
+				if (std::abs(A.m[k][k]) < 1e-15)  // 奇异矩阵
+				{
+					return Ty(0);
+				}
+				// 消元
+				for (size_t i = k + 1; i < N; ++i) 
+				{
+					Ty factor = A.m[i][k] / A.m[k][k];
+					for (size_t j = k + 1; j < N; ++j)
+					{
+						A.m[i][j] -= factor * A.m[k][j];
+					}
+				}
+			}
+			Ty det = parity;
+			for (size_t i = 0; i < N; ++i) det *= A.m[i][i];
+			return det;
+		}
+	}
 private:
 	self_type& native_multiply(const self_type& rhs) noexcept
 	{
@@ -1984,39 +2085,7 @@ using mat4f = details::TMatrix<float, 4>;
 
 namespace core::math
 {
-template<std::floating_point Ty>
-constexpr bool approx_equal(Ty a, Ty b, Ty eps = Ty{0.0001}) noexcept
-{
-    const Ty diff = std::abs(a - b);
-    const Ty scale = std::max(std::abs(a), std::abs(b));
-    return diff <= eps * std::max(scale, Ty{1});
-}
 
-constexpr bool approx_equal(float a, float b, float eps = tiny) noexcept
-{
-    return approx_equal<float>(a, b, eps);
-}
-constexpr bool approx_equal(double a, double b, double eps = tiny) noexcept
-{
-    return approx_equal<double>(a, b, eps);
-}
-constexpr bool approx_equal(long double a, long double b, long double eps = tiny) noexcept
-{
-    return approx_equal<long double>(a, b, eps);
-}
-
-constexpr bool approx_zero(float a, float eps = tiny) noexcept
-{
-	return approx_equal<float>(a, 0.0f, eps);
-}
-constexpr bool approx_zero(double a, double eps = tiny) noexcept
-{
-	return approx_equal<double>(a, 0.0, eps);
-}
-constexpr bool approx_zero(long double a, long double eps = tiny) noexcept
-{
-	return approx_equal<long double>(a, 0.0L, eps);
-}
 
 using std::clamp;
 using std::lerp;
