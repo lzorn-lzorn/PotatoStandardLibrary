@@ -1710,11 +1710,37 @@ inline constexpr linear_color4d linear_color3d::with_alpha(float alpha) const no
 
 namespace core::math
 {
+
+struct rotate2d
+{
+	size_t i, j;
+	float angle;
+};
 namespace details
 {
-
+// forward declaration
 template <typename Ty, size_t Row, size_t Col = Row>
 struct TMatrix;
+
+template <typename Ty, size_t Row, size_t Col>
+struct TMatrix;
+
+template <typename Ty, size_t N>
+	requires std::is_arithmetic_v<Ty>
+struct TMatrix <Ty, N, N>;
+}
+
+template <typename Ty, size_t N>
+constexpr inline class details::TMatrix<Ty, N, N> scale(const Ty (&factors)[N]) noexcept;
+
+template <typename Ty, size_t N>
+constexpr inline details::TMatrix<Ty, N, N> scale(const std::array<Ty, N>& factors) noexcept;
+
+template <typename Ty, size_t N>
+constexpr inline details::TMatrix<Ty, N, N> scale(const vec<Ty, N>& factors) noexcept;
+
+namespace details
+{
 
 template <typename Ty, size_t Row, size_t Col>
 struct TMatrix 
@@ -1728,6 +1754,10 @@ struct TMatrix
 };
 
 template <typename Ty, size_t N>
+	requires std::is_arithmetic_v<Ty> && (N >= 2)
+constexpr static TMatrix <Ty, N, N> Givens_Matrix(Ty angle, size_t i, size_t j) noexcept;
+
+template <typename Ty, size_t N>
 	requires std::is_arithmetic_v<Ty>
 struct TMatrix <Ty, N, N>
 {
@@ -1738,6 +1768,59 @@ struct TMatrix <Ty, N, N>
 
 	alignas(16) std::array<std::array<Ty, N>, N> m {};
 
+	constexpr static details::TMatrix<Ty, N, N> scale(const Ty (&factors)[N]) noexcept
+	{
+		return scale(factors);
+	}
+
+	constexpr static details::TMatrix<Ty, N, N> scale(const std::array<Ty, N>& factors) noexcept
+	{
+		return scale(factors);
+	}
+
+	constexpr static details::TMatrix<Ty, N, N> scale(const vec<Ty, N>& factors) noexcept
+	{
+		return scale(factors.coordinates);
+	}
+
+	constexpr static TMatrix rotate(rotate2d rotate_desc) noexcept
+		requires std::is_floating_point_v<Ty>
+	{
+		return Givens_Matrix(rotate_desc.i, rotate_desc.j, rotate_desc.angle);
+	}
+
+	constexpr static self_type rotate(Ty angle) noexcept
+		requires std::is_floating_point_v<Ty> && (N == 2)
+	{
+		return Givens_Matrix<Ty, 2>(0, 1, angle);  
+	}
+
+	constexpr static TMatrix rotate_x(Ty angle) noexcept { return Givens_Matrix(1, 2, angle); }
+	constexpr static TMatrix rotate_y(Ty angle) noexcept { return Givens_Matrix(2, 0, angle); }
+	constexpr static TMatrix rotate_z(Ty angle) noexcept { return Givens_Matrix(0, 1, angle); }
+
+	constexpr static TMatrix rotate(Ty angle, const Ty (&axis)[3]) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+		return Rotate3D(angle, axis[0], axis[1], axis[2]);
+	}
+	constexpr static TMatrix rotate(Ty angle, const vec<Ty, 3> axis) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+		return Rotate3D(angle, axis.x(), axis.y(), axis.z());
+	}
+
+	// 4D 旋转, 仅是3D旋转的齐次版本
+	constexpr static TMatrix rotate(Ty angle, const Ty (&axis)[4]) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+		return Rotate3D(angle, axis[0], axis[1], axis[2], axis[3]);
+	}
+	constexpr static TMatrix rotate(Ty angle, const vec<Ty, 4> axis) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+		return Rotate4D(angle, axis.x(), axis.y(), axis.z(), axis.w());
+	}
 	constexpr static self_type identity() noexcept
 	{
 		self_type result = zero();
@@ -1752,9 +1835,12 @@ struct TMatrix <Ty, N, N>
 		return self_type{};
 	}
 	constexpr static self_type one() noexcept {
-		return fill(1);
+		self_type m{};
+		for (auto& row : m.m) row.fill(Ty(1));
+		return m;
 	}
-	static self_type fill(self_type& mat, Ty value) noexcept {
+	static self_type fill(self_type& mat, Ty value) noexcept 
+	{
 		for (auto& row : mat.m) 
 		{
 			std::fill(row.begin(), row.end(), value);
@@ -1765,11 +1851,14 @@ struct TMatrix <Ty, N, N>
 	{
 		return fill(*this, value);
 	}
-	self_type& operator+=(const self_type& rhs) noexcept {
+	
+	self_type& operator+=(const self_type& rhs) noexcept 
+	{
 		std::transform(&m[0][0], &m[0][0] + N*N, &rhs.m[0][0], &m[0][0], std::plus<>{});
 		return *this;
 	}
-	self_type& operator+=(Ty rhs) noexcept {
+	self_type& operator+=(Ty rhs) noexcept 
+	{
 		std::for_each(&m[0][0], &m[0][0] + N*N, [rhs](Ty& v){ v += rhs; });
 		return *this;
 	}
@@ -1825,16 +1914,16 @@ struct TMatrix <Ty, N, N>
 		}
 		else 
 		{
-			return native_multiply(rhs);
+			return Multiply_Natively(rhs);
 		}
 		
 	#else
-		return native_multiply(rhs);
+		return Multiply_Natively(rhs);
 	#endif
 		
 		
 	}
-	self_type& transpositive() noexcept
+	self_type& transpose() noexcept
 	{
 	#if defined(__SSE2__)
 		if constexpr (std::is_same_v<Ty, float> && N == 4)
@@ -1853,12 +1942,17 @@ struct TMatrix <Ty, N, N>
 		}
 		else
 		{
-			return native_transpose();
+			return Transpose_Natively();
 		}
 	#endif
-		return native_transpose();
+		return Transpose_Natively();
 	}
-	bool inverse() noexcept
+
+	self_type inverse() noexcept
+	{
+
+	}
+	bool is_invertible() noexcept
 	{
 		return approx_equal(det(), 0.f, 1e-6);
 	}
@@ -1930,7 +2024,7 @@ struct TMatrix <Ty, N, N>
 		}
 	}
 private:
-	self_type& native_multiply(const self_type& rhs) noexcept
+	self_type& Multiply_Natively(const self_type& rhs) noexcept
 	{
 		TMatrix <Ty, N, N> result = zero();
 		if constexpr (N == 4)
@@ -1990,7 +2084,7 @@ private:
 		*this = result;
 		return *this;
 	}
-	self_type& native_transpositive() noexcept
+	self_type& Transpose_Natively() noexcept
 	{
 		if constexpr (N == 1)
 		{
@@ -2025,76 +2119,206 @@ private:
 		}
 		return *this;
 	}
+	constexpr static TMatrix<Ty, 3, 3> Rotate3D(Ty angle, Ty x, Ty y, Ty z) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+		TMatrix<Ty, 3, 3> result = TMatrix<Ty, 3, 3>::identity();
+
+		// 归一化旋转轴
+		Ty len = std::sqrt(x*x + y*y + z*z);
+		// 零轴, 返回单位矩阵
+		if (len < epsilon) {
+			return result;   
+		}
+		x /= len;
+		y /= len;
+		z /= len;
+
+		Ty c = std::cos(angle);
+		Ty s = std::sin(angle);
+		Ty t = Ty(1) - c;
+
+		// 罗德里格斯公式展开
+		result.m[0][0] = x * x * t + c;
+		result.m[0][1] = x * y * t - z * s;
+		result.m[0][2] = x * z * t + y * s;
+
+		result.m[1][0] = y * x * t + z * s;
+		result.m[1][1] = y * y * t + c;
+		result.m[1][2] = y * z * t - x * s;
+
+		result.m[2][0] = z * x * t - y * s;
+		result.m[2][1] = z * y * t + x * s;
+		result.m[2][2] = z * z * t + c;
+
+		return result;
+	}
+	constexpr static TMatrix<Ty, 4, 4> Rotate4D(Ty angle, Ty x, Ty y, Ty z, Ty w) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+		(void)w;
+		TMatrix<Ty, 4, 4> result = TMatrix<Ty, 4, 4>::identity();
+
+		// 归一化旋转轴
+		Ty len = std::sqrt(x*x + y*y + z*z);
+		// 零轴, 返回单位矩阵
+		if (len < epsilon) {
+			return result;   
+		}
+		x /= len;
+		y /= len;
+		z /= len;
+
+		Ty c = std::cos(angle);
+		Ty s = std::sin(angle);
+		Ty t = Ty(1) - c;
+
+		// 罗德里格斯公式展开
+		result.m[0][0] = x * x * t + c;
+		result.m[0][1] = x * y * t - z * s;
+		result.m[0][2] = x * z * t + y * s;
+
+		result.m[1][0] = y * x * t + z * s;
+		result.m[1][1] = y * y * t + c;
+		result.m[1][2] = y * z * t - x * s;
+
+		result.m[2][0] = z * x * t - y * s;
+		result.m[2][1] = z * y * t + x * s;
+		result.m[2][2] = z * z * t + c;
+
+		return result;
+	}
 };
 
 template <typename Ty, size_t N>
-TMatrix <Ty, N, N> native_multiply(const TMatrix <Ty, N, N>& mat1, const TMatrix <Ty, N, N>& mat2) noexcept
+	requires std::is_floating_point_v<Ty> && (N >= 2)
+constexpr static TMatrix <Ty, N, N> Givens_Matrix(size_t i, size_t j, Ty angle) noexcept
+{
+	TMatrix <Ty, N, N> m = TMatrix<Ty, N, N>::identity();
+	Ty c = std::cos(angle);
+	Ty s = std::sin(angle);
+	m.m[i][i] = c;
+	m.m[i][j] = -s;
+	m.m[j][i] = s;
+	m.m[j][j] = c;
+	return m;
+}
+template <typename Ty, size_t N>
+TMatrix <Ty, N, N> Multiply_Natively(const TMatrix <Ty, N, N>& mat1, const TMatrix <Ty, N, N>& mat2) noexcept
 {
 	TMatrix <Ty, N, N> result = zero();
 	
 	return result;
 }
-
-
-template <typename Ty, size_t N>
-[[nodiscard]] constexpr static vec<Ty, N> operator*(const TMatrix <Ty, N, N>& mat, const vec<Ty, N>& vec) noexcept;
-template <typename Ty, size_t N>
-[[nodiscard]] constexpr static vec<Ty, N> operator*(const vec<Ty, N>& vec, const TMatrix <Ty, N, N>& mat) noexcept;
+} // TMatrix namespace details 
 
 template <typename Ty, size_t N>
-constexpr static TMatrix <Ty, N, N> perspective(Ty fov, Ty aspect, Ty near, Ty far) noexcept;
+[[nodiscard]] constexpr static vec<Ty, N> operator*(const details::TMatrix <Ty, N, N>& mat, const vec<Ty, N>& vec) noexcept;
+template <typename Ty, size_t N>
+[[nodiscard]] constexpr static vec<Ty, N> operator*(const vec<Ty, N>& vec, const details::TMatrix <Ty, N, N>& mat) noexcept;
 
 template <typename Ty, size_t N>
-constexpr static TMatrix <Ty, N, N> translate(Ty x, Ty y, Ty z) noexcept;
+constexpr static details::TMatrix <Ty, N, N> perspective(Ty fov, Ty aspect, Ty near, Ty far) noexcept;
 
 template <typename Ty, size_t N>
-constexpr static TMatrix <Ty, N, N> rotate(Ty angle, Ty x, Ty y, Ty z) noexcept;
+constexpr static details::TMatrix <Ty, N, N> translate(Ty x, Ty y, Ty z) noexcept;
 
+
+/**
+ * @about 旋转矩阵: 
+ * >    在 N 维空间中, 旋转是一个保持原点不变, 保距且行列式为 1 的线性变换. 
+ * >    任意 N 维旋转都可以分解为一系列平面旋转(Givens 旋转)的乘积.每个平面旋转仅改变
+ * >    两个坐标轴构成的平面上的分量, 其余坐标保持不变.
+ * @about Givens 旋转: 
+ * >    在 N 维空间中, Givens 旋转是一个特殊的旋转, 它仅在两个坐标轴构成的平面上进行
+ * >    旋转, 平面 (i,j) 上的旋转角度\theta (右手法则, 设 i < j), 
+ * >    则对应的 N*N 矩阵 G 满足:
+ * >         G[k][k] = 1,  k != i, j
+ * >         G[i][i] = G[j][j] = cos(\theta)
+ * >         G[i][j] = -sin(\theta)
+ * >         G[j][i] = sin(\theta)
+ * >    其他元素为 0
+ * @brief 获取 N 维 旋转矩阵
+ * @param InputIter 是一个输入迭代器, 其值类型为 rotate2d, 用于指定每个平面旋转的参数.
+ */
+template <typename Ty, size_t N, typename InputIter>
+constexpr static details::TMatrix <Ty, N, N> rotate(InputIter first, InputIter last) noexcept
+{
+	details::TMatrix <Ty, N, N> idt = details::TMatrix<Ty, N, N>::identity();
+	for (; first != last; ++first) 
+	{
+		auto [i, j, angle] = *first;
+		idt = idt.multiply(details::TMatrix<Ty, N, N>::rotate({i, j, angle}));
+	}
+	return idt;
+}
+
+template <typename Ty, typename... Args>
+constexpr inline details::TMatrix<Ty, sizeof...(Args), sizeof...(Args)> scale(Args... args) noexcept
+{
+	static_assert((std::is_convertible_v<Args, Ty> && ...), "All arguments must be convertible to Ty");
+	using matix = details::TMatrix<Ty, sizeof...(Args), sizeof...(Args)>;
+	matix result = matix::zero();
+
+	for (size_t i = 0; i < sizeof...(Args); ++i)
+	{
+        result.m[i][i] = static_cast<Ty>(std::get<i>(std::forward_as_tuple(args...)));
+    }
+	return result;
+}
+
+namespace details
+{
+template <typename Ty, size_t N, size_t... Is>
+constexpr inline details::TMatrix<Ty, N, N> Scale_Impl(const Ty (&factors)[N], std::index_sequence<Is...>) noexcept
+{
+	return scale<Ty>(factors[Is]...);
+}
+template <typename Ty, size_t N, size_t... Is>
+constexpr inline details::TMatrix<Ty, N, N> Scale_Impl(const std::array<Ty, N>& factors, std::index_sequence<Is...>) noexcept
+{
+	return scale<Ty>(factors[Is]...);
+}
+}
 /**
  * @biref 获取 N 维 缩放矩阵: 缩放矩阵是一个对角矩阵, 第 i 个对角元为第 i 轴的缩放因子
  * @param factors C-style 缩放因子, 用于指定对应轴的缩放因子
  */ 
 template <typename Ty, size_t N>
-constexpr inline TMatrix<Ty, N, N> scale(const Ty (&factors)[N]) noexcept
+constexpr inline details::TMatrix<Ty, N, N> scale(const Ty (&factors)[N]) noexcept
 {
-	using matix = TMatrix<Ty, N, N>;
-	matix result = matix::zero();
-	for (size_t i = 0; i < N; ++i)
-	{
-        result.m[i][i] = factors[i];
-    }
-	return result;
+	return details::Scale_Impl<Ty>(factors, std::make_index_sequence<N>{});
 }
 
 template <typename Ty, size_t N>
-constexpr inline TMatrix<Ty, N, N> scale(const std::array<Ty, N>& factors) noexcept
+constexpr inline details::TMatrix<Ty, N, N> scale(const std::array<Ty, N>& factors) noexcept
 {
-	return scale(factors);
+	return details::Scale_Impl<Ty>(factors, std::make_index_sequence<N>{});
 }
 
-template <size_t N, typename InputIt>
-constexpr inline auto scale(InputIt first, InputIt last) {
-    using Ty = typename std::iterator_traits<InputIt>::value_type;
-    return TMatrix<Ty, N>::scale(first, last);
+template <typename Ty, size_t N>
+constexpr inline details::TMatrix<Ty, N, N> scale(const vec<Ty, N>& factors) noexcept
+{
+	return scale(factors.coordinates);
 }
 
 
 template <typename Ty, size_t N>
-TMatrix <Ty, N, N> operator+(const TMatrix <Ty, N, N> lhs, const TMatrix <Ty, N, N>& rhs) noexcept;
+details::TMatrix <Ty, N, N> operator+(const details::TMatrix <Ty, N, N> lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept;
 template <typename Ty, size_t N>
-TMatrix <Ty, N, N> operator+(Ty lhs, const TMatrix <Ty, N, N>& rhs) noexcept;
+details::TMatrix <Ty, N, N> operator+(Ty lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept;
 template <typename Ty, size_t N>
-TMatrix <Ty, N, N> operator+(const TMatrix <Ty, N, N> lhs, Ty rhs) noexcept;
+details::TMatrix <Ty, N, N> operator+(const details::TMatrix <Ty, N, N> lhs, Ty rhs) noexcept;
 
 template <typename Ty, size_t N>
-TMatrix <Ty, N, N> operator-(const TMatrix <Ty, N, N> lhs, const TMatrix <Ty, N, N>& rhs) noexcept;
+details::TMatrix <Ty, N, N> operator-(const details::TMatrix <Ty, N, N> lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept;
 template <typename Ty, size_t N>
-TMatrix <Ty, N, N> operator-(Ty lhs, const TMatrix <Ty, N, N>& rhs) noexcept;
+details::TMatrix <Ty, N, N> operator-(Ty lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept;
 template <typename Ty, size_t N>
-TMatrix <Ty, N, N> operator-(const TMatrix <Ty, N, N> lhs, Ty rhs) noexcept;
+details::TMatrix <Ty, N, N> operator-(const details::TMatrix <Ty, N, N> lhs, Ty rhs) noexcept;
 
 
-}
+
 
 using mat2i = details::TMatrix<int32_t, 2>;
 using mat2f = details::TMatrix<float, 2>;
