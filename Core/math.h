@@ -2050,8 +2050,34 @@ constexpr static TMatrix <Ty, N, N> translate(Ty x, Ty y, Ty z) noexcept;
 template <typename Ty, size_t N>
 constexpr static TMatrix <Ty, N, N> rotate(Ty angle, Ty x, Ty y, Ty z) noexcept;
 
+/**
+ * @biref 获取 N 维 缩放矩阵: 缩放矩阵是一个对角矩阵, 第 i 个对角元为第 i 轴的缩放因子
+ * @param factors C-style 缩放因子, 用于指定对应轴的缩放因子
+ */ 
 template <typename Ty, size_t N>
-constexpr static TMatrix <Ty, N, N> scale(Ty x, Ty y, Ty z) noexcept;
+constexpr inline TMatrix<Ty, N, N> scale(const Ty (&factors)[N]) noexcept
+{
+	using matix = TMatrix<Ty, N, N>;
+	matix result = matix::zero();
+	for (size_t i = 0; i < N; ++i)
+	{
+        result.m[i][i] = factors[i];
+    }
+	return result;
+}
+
+template <typename Ty, size_t N>
+constexpr inline TMatrix<Ty, N, N> scale(const std::array<Ty, N>& factors) noexcept
+{
+	return scale(factors);
+}
+
+template <size_t N, typename InputIt>
+constexpr inline auto scale(InputIt first, InputIt last) {
+    using Ty = typename std::iterator_traits<InputIt>::value_type;
+    return TMatrix<Ty, N>::scale(first, last);
+}
+
 
 template <typename Ty, size_t N>
 TMatrix <Ty, N, N> operator+(const TMatrix <Ty, N, N> lhs, const TMatrix <Ty, N, N>& rhs) noexcept;
