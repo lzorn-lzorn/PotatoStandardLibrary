@@ -24,7 +24,7 @@
 #include <emmintrin.h>
 #endif
 
-
+#include "platform.h"
 namespace core::math
 {
 
@@ -2274,8 +2274,43 @@ template <typename Ty, size_t N>
 #endif
 }
 
+/**
+ * @brief 创建透视投影矩阵 (右手系 Y-up)
+ * @param fov 视野角度: 相机在竖直方向能看到的角度范围
+ * @param aspect 宽高比: 用于将方形视锥体拉伸到实际屏幕比例
+ * @param near 近平面: 任何离相机更近的物体将被裁剪
+ * @param far 远平面: 任何离相机更远的物体将被裁剪
+ */
 template <typename Ty, size_t N>
-constexpr static details::TMatrix<Ty, N, N> perspective(Ty fov, Ty aspect, Ty near, Ty far) noexcept;
+constexpr inline details::TMatrix<Ty, N, N> perspective(Ty fov, Ty aspect, Ty near, Ty far) noexcept
+{
+    static_assert(N == 4, "Perspective projection matrix requires N=4");
+    static_assert(std::is_floating_point_v<Ty>, "Floating-point type required for perspective");
+
+    ASSUME(fov > Ty(0));
+    ASSUME(aspect > Ty(0));
+    ASSUME(near > Ty(0));
+    ASSUME(far > near);
+
+    assert(fov > Ty(0) && "Field of view must be positive");
+    assert(aspect > Ty(0) && "Aspect ratio must be positive");
+    assert(near > Ty(0) && "Near plane must be positive");
+    assert(far > near && "Far plane must be greater than near plane");
+
+    details::TMatrix<Ty, 4, 4> result = details::TMatrix<Ty, 4, 4>::zero();
+
+    Ty tan_half_fov = std::tan(fov * Ty(0.5));
+    Ty z_range = near - far;
+    Ty z_range_inv = Ty(1) / z_range;
+
+    result.m[0][0] = Ty(1) / (aspect * tan_half_fov);
+    result.m[1][1] = Ty(1) / tan_half_fov;
+    result.m[2][2] = (far + near) * z_range_inv;
+    result.m[2][3] = Ty(2) * far * near * z_range_inv;
+    result.m[3][2] = -Ty(1);
+
+    return result;
+}
 
 
 namespace details
@@ -2333,6 +2368,16 @@ constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty angle, Ty x, Ty y, Ty 
     return result;
 }
 
+/**
+ * @about ![Rodrigues' rotation formula](https://zhuanlan.zhihu.com/p/451579313)
+ * >   给定一个单位旋转轴 k = (x,y,z) 和一个旋转角度 \theta, 
+ * >   则绕 k 旋转 \theta 的旋转矩阵 R 可以表示为:
+ * >   R = I + sin(\theta) * K + (1 - cos(\theta)) * K^2
+ * >   其中 I 是单位矩阵, K 是 k 的反对称矩阵:
+ * >       K = |  0  -z   y |
+ * >           |  z   0  -x |
+ * >           | -y   x   0 |
+ */
 template <typename Ty>
 constexpr static TMatrix<Ty, 4, 4> Get_Rotate4D_Matrix(Ty angle, Ty x, Ty y, Ty z, Ty w) noexcept
 {
