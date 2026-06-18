@@ -1711,11 +1711,6 @@ inline constexpr linear_color4d linear_color3d::with_alpha(float alpha) const no
 namespace core::math
 {
 
-struct rotate2d
-{
-	size_t i, j;
-	float angle;
-};
 namespace details
 {
 // forward declaration
@@ -1742,6 +1737,32 @@ constexpr inline details::TMatrix<Ty, N, N> scale(const vec<Ty, N>& factors) noe
 namespace details
 {
 
+
+
+/// 2D 旋转矩阵（Givens 旋转）
+template <typename Ty, size_t N>
+	requires std::is_arithmetic_v<Ty> && (N >= 2)
+constexpr static TMatrix <Ty, N, N> Givens_Matrix(Ty angle, size_t i, size_t j) noexcept;
+
+/// 获取平移矩阵
+template <typename Ty, size_t N>
+constexpr static details::TMatrix<Ty, N, N> Get_Translation_Matrix(const vec<Ty, N>& offset) noexcept;
+template <typename Ty, size_t N>
+constexpr static details::TMatrix<Ty, N, N> Get_Translation_Matrix(const Ty (&offset)[N]) noexcept;
+
+/// 获取缩放矩阵
+template <typename Ty, size_t N>
+constexpr inline details::TMatrix<Ty, N, N> Get_Scaling_Matrix(const vec<Ty, N>& factors) noexcept;
+template <typename Ty, size_t N>
+constexpr inline details::TMatrix<Ty, N, N> Get_Scaling_Matrix(const Ty (&factors)[N]) noexcept;
+
+/// 获取旋转矩阵
+template <typename Ty>
+constexpr static TMatrix<Ty, 4, 4> Get_Rotate4D_Matrix(Ty angle, Ty x, Ty y, Ty z, Ty w) noexcept;
+template <typename Ty>
+constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty angle, Ty x, Ty y, Ty z) noexcept;
+
+// 默认行主序
 template <typename Ty, size_t Row, size_t Col>
 struct TMatrix 
 {
@@ -1754,10 +1775,6 @@ struct TMatrix
 };
 
 template <typename Ty, size_t N>
-	requires std::is_arithmetic_v<Ty> && (N >= 2)
-constexpr static TMatrix <Ty, N, N> Givens_Matrix(Ty angle, size_t i, size_t j) noexcept;
-
-template <typename Ty, size_t N>
 	requires std::is_arithmetic_v<Ty>
 struct TMatrix <Ty, N, N>
 {
@@ -1768,59 +1785,68 @@ struct TMatrix <Ty, N, N>
 
 	alignas(16) std::array<std::array<Ty, N>, N> m {};
 
-	constexpr static details::TMatrix<Ty, N, N> scale(const Ty (&factors)[N]) noexcept
+    /// 获取缩放矩阵
+	constexpr static details::TMatrix<Ty, N, N> get_scaling_mat(const Ty (&factors)[N]) noexcept
 	{
-		return scale(factors);
+		return Get_Scaling_Matrix(factors);
 	}
 
-	constexpr static details::TMatrix<Ty, N, N> scale(const std::array<Ty, N>& factors) noexcept
+	constexpr static details::TMatrix<Ty, N, N> get_scaling_mat(const std::array<Ty, N>& factors) noexcept
 	{
-		return scale(factors);
+		return Get_Scaling_Matrix(factors);
 	}
 
-	constexpr static details::TMatrix<Ty, N, N> scale(const vec<Ty, N>& factors) noexcept
+	constexpr static details::TMatrix<Ty, N, N> get_scaling_mat(const vec<Ty, N>& factors) noexcept
 	{
-		return scale(factors.coordinates);
+		return Get_Scaling_Matrix(factors);
 	}
 
-	constexpr static TMatrix rotate(rotate2d rotate_desc) noexcept
+    /// 获取2D旋转矩阵
+	constexpr static TMatrix get_rotate2d_mat(size_t i, size_t j, Ty angle) noexcept
 		requires std::is_floating_point_v<Ty>
 	{
-		return Givens_Matrix(rotate_desc.i, rotate_desc.j, rotate_desc.angle);
+		return Givens_Matrix(angle, i, j);
 	}
 
-	constexpr static self_type rotate(Ty angle) noexcept
-		requires std::is_floating_point_v<Ty> && (N == 2)
+    /// 获取绕主轴的旋转矩阵
+	constexpr static TMatrix get_rotate2d_x(Ty angle) noexcept { return Givens_Matrix(angle, 1, 2); }
+	constexpr static TMatrix get_rotate2d_y(Ty angle) noexcept { return Givens_Matrix(angle, 2, 0); }
+	constexpr static TMatrix get_rotate2d_z(Ty angle) noexcept { return Givens_Matrix(angle, 0, 1); }
+
+	
+
+    /// 对自身执行一次缩放变换
+    self_type& scale(vec<Ty, N> factors) noexcept
 	{
-		return Givens_Matrix<Ty, 2>(0, 1, angle);  
+        multiply(details::Get_Scaling_Matrix(factors));
+		return *this;
+	}
+	/// 对自身进行一次3D旋转变换
+    self_type& rotate(Ty angle, const Ty (&axis)[3]) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+        multiply(Get_Rotate3D_Matrix(angle, axis[0], axis[1], axis[2]));
+		return *this;
+	}
+	self_type& rotate(Ty angle, const vec<Ty, 3> axis) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+        multiply(Get_Rotate3D_Matrix(angle, axis.x(), axis.y(), axis.z()));
+		return *this;
+	}
+	self_type& rotate(Ty angle, const Ty (&axis)[4]) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+		multiply(Get_Rotate4D_Matrix(angle, axis[0], axis[1], axis[2], axis[3]));
+        return *this;
+	}
+	self_type& rotate(Ty angle, const vec<Ty, 4> axis) noexcept
+	{
+		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+		multiply(Get_Rotate4D_Matrix(angle, axis.x(), axis.y(), axis.z(), axis.w()));
+        return *this;
 	}
 
-	constexpr static TMatrix rotate_x(Ty angle) noexcept { return Givens_Matrix(1, 2, angle); }
-	constexpr static TMatrix rotate_y(Ty angle) noexcept { return Givens_Matrix(2, 0, angle); }
-	constexpr static TMatrix rotate_z(Ty angle) noexcept { return Givens_Matrix(0, 1, angle); }
-
-	constexpr static TMatrix rotate(Ty angle, const Ty (&axis)[3]) noexcept
-	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-		return Rotate3D(angle, axis[0], axis[1], axis[2]);
-	}
-	constexpr static TMatrix rotate(Ty angle, const vec<Ty, 3> axis) noexcept
-	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-		return Rotate3D(angle, axis.x(), axis.y(), axis.z());
-	}
-
-	// 4D 旋转, 仅是3D旋转的齐次版本
-	constexpr static TMatrix rotate(Ty angle, const Ty (&axis)[4]) noexcept
-	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-		return Rotate3D(angle, axis[0], axis[1], axis[2], axis[3]);
-	}
-	constexpr static TMatrix rotate(Ty angle, const vec<Ty, 4> axis) noexcept
-	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-		return Rotate4D(angle, axis.x(), axis.y(), axis.z(), axis.w());
-	}
 	constexpr static self_type identity() noexcept
 	{
 		self_type result = zero();
@@ -1836,7 +1862,10 @@ struct TMatrix <Ty, N, N>
 	}
 	constexpr static self_type one() noexcept {
 		self_type m{};
-		for (auto& row : m.m) row.fill(Ty(1));
+		for (auto& row : m.m) 
+        {
+            row.fill(Ty(1));
+        }
 		return m;
 	}
 	static self_type fill(self_type& mat, Ty value) noexcept 
@@ -1948,6 +1977,7 @@ struct TMatrix <Ty, N, N>
 		return Transpose_Natively();
 	}
 
+   
 	self_type inverse() noexcept
 	{
 
@@ -2026,63 +2056,7 @@ struct TMatrix <Ty, N, N>
 private:
 	self_type& Multiply_Natively(const self_type& rhs) noexcept
 	{
-		TMatrix <Ty, N, N> result = zero();
-		if constexpr (N == 4)
-		{
-			result.m[0][0] = m[0][0] * rhs.m[0][0] + m[0][1] * rhs.m[1][0] + m[0][2] * rhs.m[2][0] + m[0][3] * rhs.m[3][0];
-			result.m[0][1] = m[0][0] * rhs.m[0][1] + m[0][1] * rhs.m[1][1] + m[0][2] * rhs.m[2][1] + m[0][3] * rhs.m[3][1];
-			result.m[0][2] = m[0][0] * rhs.m[0][2] + m[0][1] * rhs.m[1][2] + m[0][2] * rhs.m[2][2] + m[0][3] * rhs.m[3][2];
-			result.m[0][3] = m[0][0] * rhs.m[0][3] + m[0][1] * rhs.m[1][3] + m[0][2] * rhs.m[2][3] + m[0][3] * rhs.m[3][3];
-			result.m[1][0] = m[1][0] * rhs.m[0][0] + m[1][1] * rhs.m[1][0] + m[1][2] * rhs.m[2][0] + m[1][3] * rhs.m[3][0];
-			result.m[1][1] = m[1][0] * rhs.m[0][1] + m[1][1] * rhs.m[1][1] + m[1][2] * rhs.m[2][1] + m[1][3] * rhs.m[3][1];
-			result.m[1][2] = m[1][0] * rhs.m[0][2] + m[1][1] * rhs.m[1][2] + m[1][2] * rhs.m[2][2] + m[1][3] * rhs.m[3][2];
-			result.m[1][3] = m[1][0] * rhs.m[0][3] + m[1][1] * rhs.m[1][3] + m[1][2] * rhs.m[2][3] + m[1][3] * rhs.m[3][3];
-			result.m[2][0] = m[2][0] * rhs.m[0][0] + m[2][1] * rhs.m[1][0] + m[2][2] * rhs.m[2][0] + m[2][3] * rhs.m[3][0];
-			result.m[2][1] = m[2][0] * rhs.m[0][1] + m[2][1] * rhs.m[1][1] + m[2][2] * rhs.m[2][1] + m[2][3] * rhs.m[3][1];
-			result.m[2][2] = m[2][0] * rhs.m[0][2] + m[2][1] * rhs.m[1][2] + m[2][2] * rhs.m[2][2] + m[2][3] * rhs.m[3][2];
-			result.m[2][3] = m[2][0] * rhs.m[0][3] + m[2][1] * rhs.m[1][3] + m[2][2] * rhs.m[2][3] + m[2][3] * rhs.m[3][3];
-			result.m[3][0] = m[3][0] * rhs.m[0][0] + m[3][1] * rhs.m[1][0] + m[3][2] * rhs.m[2][0] + m[3][3] * rhs.m[3][0];
-			result.m[3][1] = m[3][0] * rhs.m[0][1] + m[3][1] * rhs.m[1][1] + m[3][2] * rhs.m[2][1] + m[3][3] * rhs.m[3][1];
-			result.m[3][2] = m[3][0] * rhs.m[0][2] + m[3][1] * rhs.m[1][2] + m[3][2] * rhs.m[2][2] + m[3][3] * rhs.m[3][2];
-			result.m[3][3] = m[3][0] * rhs.m[0][3] + m[3][1] * rhs.m[1][3] + m[3][2] * rhs.m[2][3] + m[3][3] * rhs.m[3][3];
-		}
-		else if constexpr (N == 3)
-		{
-			result.m[0][0] = m[0][0]*rhs.m[0][0] + m[0][1]*rhs.m[1][0] + m[0][2]*rhs.m[2][0];
-			result.m[0][1] = m[0][0]*rhs.m[0][1] + m[0][1]*rhs.m[1][1] + m[0][2]*rhs.m[2][1];
-			result.m[0][2] = m[0][0]*rhs.m[0][2] + m[0][1]*rhs.m[1][2] + m[0][2]*rhs.m[2][2];
-
-			result.m[1][0] = m[1][0]*rhs.m[0][0] + m[1][1]*rhs.m[1][0] + m[1][2]*rhs.m[2][0];
-			result.m[1][1] = m[1][0]*rhs.m[0][1] + m[1][1]*rhs.m[1][1] + m[1][2]*rhs.m[2][1];
-			result.m[1][2] = m[1][0]*rhs.m[0][2] + m[1][1]*rhs.m[1][2] + m[1][2]*rhs.m[2][2];
-
-			result.m[2][0] = m[2][0]*rhs.m[0][0] + m[2][1]*rhs.m[1][0] + m[2][2]*rhs.m[2][0];
-			result.m[2][1] = m[2][0]*rhs.m[0][1] + m[2][1]*rhs.m[1][1] + m[2][2]*rhs.m[2][1];
-			result.m[2][2] = m[2][0]*rhs.m[0][2] + m[2][1]*rhs.m[1][2] + m[2][2]*rhs.m[2][2];
-		}
-		else if constexpr (N == 2)
-		{
-			result.m[0][0] = m[0][0]*rhs.m[0][0] + m[0][1]*rhs.m[1][0];
-            result.m[0][1] = m[0][0]*rhs.m[0][1] + m[0][1]*rhs.m[1][1];
-            result.m[1][0] = m[1][0]*rhs.m[0][0] + m[1][1]*rhs.m[1][0];
-            result.m[1][1] = m[1][0]*rhs.m[0][1] + m[1][1]*rhs.m[1][1];
-		}
-		else if constexpr (N == 1)
-		{
-			result.m[0][0] = m[0][0] * rhs.m[0][0];
-		}
-		else
-		{	
-			for (size_t i = 0; i < N; ++i) {
-				for (size_t k = 0; k < N; ++k) {
-					for (size_t j = 0; j < N; ++j) {
-						result.m[i][j] += m[i][k] * rhs.m[k][j];
-					}
-				}
-			}
-		}
-		*this = result;
-		return *this;
+		return multiply(*this, rhs);
 	}
 	self_type& Transpose_Natively() noexcept
 	{
@@ -2119,75 +2093,6 @@ private:
 		}
 		return *this;
 	}
-	constexpr static TMatrix<Ty, 3, 3> Rotate3D(Ty angle, Ty x, Ty y, Ty z) noexcept
-	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-		TMatrix<Ty, 3, 3> result = TMatrix<Ty, 3, 3>::identity();
-
-		// 归一化旋转轴
-		Ty len = std::sqrt(x*x + y*y + z*z);
-		// 零轴, 返回单位矩阵
-		if (len < epsilon) {
-			return result;   
-		}
-		x /= len;
-		y /= len;
-		z /= len;
-
-		Ty c = std::cos(angle);
-		Ty s = std::sin(angle);
-		Ty t = Ty(1) - c;
-
-		// 罗德里格斯公式展开
-		result.m[0][0] = x * x * t + c;
-		result.m[0][1] = x * y * t - z * s;
-		result.m[0][2] = x * z * t + y * s;
-
-		result.m[1][0] = y * x * t + z * s;
-		result.m[1][1] = y * y * t + c;
-		result.m[1][2] = y * z * t - x * s;
-
-		result.m[2][0] = z * x * t - y * s;
-		result.m[2][1] = z * y * t + x * s;
-		result.m[2][2] = z * z * t + c;
-
-		return result;
-	}
-	constexpr static TMatrix<Ty, 4, 4> Rotate4D(Ty angle, Ty x, Ty y, Ty z, Ty w) noexcept
-	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-		(void)w;
-		TMatrix<Ty, 4, 4> result = TMatrix<Ty, 4, 4>::identity();
-
-		// 归一化旋转轴
-		Ty len = std::sqrt(x*x + y*y + z*z);
-		// 零轴, 返回单位矩阵
-		if (len < epsilon) {
-			return result;   
-		}
-		x /= len;
-		y /= len;
-		z /= len;
-
-		Ty c = std::cos(angle);
-		Ty s = std::sin(angle);
-		Ty t = Ty(1) - c;
-
-		// 罗德里格斯公式展开
-		result.m[0][0] = x * x * t + c;
-		result.m[0][1] = x * y * t - z * s;
-		result.m[0][2] = x * z * t + y * s;
-
-		result.m[1][0] = y * x * t + z * s;
-		result.m[1][1] = y * y * t + c;
-		result.m[1][2] = y * z * t - x * s;
-
-		result.m[2][0] = z * x * t - y * s;
-		result.m[2][1] = z * y * t + x * s;
-		result.m[2][2] = z * z * t + c;
-
-		return result;
-	}
 };
 
 template <typename Ty, size_t N>
@@ -2207,23 +2112,174 @@ template <typename Ty, size_t N>
 TMatrix <Ty, N, N> Multiply_Natively(const TMatrix <Ty, N, N>& mat1, const TMatrix <Ty, N, N>& mat2) noexcept
 {
 	TMatrix <Ty, N, N> result = zero();
-	
-	return result;
+    if constexpr (N == 4)
+    {
+        result.m[0][0] = mat1.m[0][0] * mat2.m[0][0] + mat1.m[0][1] * mat2.m[1][0] + mat1.m[0][2] * mat2.m[2][0] + mat1.m[0][3] * mat2.m[3][0];
+        result.m[0][1] = mat1.m[0][0] * mat2.m[0][1] + mat1.m[0][1] * mat2.m[1][1] + mat1.m[0][2] * mat2.m[2][1] + mat1.m[0][3] * mat2.m[3][1];
+        result.m[0][2] = mat1.m[0][0] * mat2.m[0][2] + mat1.m[0][1] * mat2.m[1][2] + mat1.m[0][2] * mat2.m[2][2] + mat1.m[0][3] * mat2.m[3][2];
+        result.m[0][3] = mat1.m[0][0] * mat2.m[0][3] + mat1.m[0][1] * mat2.m[1][3] + mat1.m[0][2] * mat2.m[2][3] + mat1.m[0][3] * mat2.m[3][3];
+        result.m[1][0] = mat1.m[1][0] * mat2.m[0][0] + mat1.m[1][1] * mat2.m[1][0] + mat1.m[1][2] * mat2.m[2][0] + mat1.m[1][3] * mat2.m[3][0];
+        result.m[1][1] = mat1.m[1][0] * mat2.m[0][1] + mat1.m[1][1] * mat2.m[1][1] + mat1.m[1][2] * mat2.m[2][1] + mat1.m[1][3] * mat2.m[3][1];
+        result.m[1][2] = mat1.m[1][0] * mat2.m[0][2] + mat1.m[1][1] * mat2.m[1][2] + mat1.m[1][2] * mat2.m[2][2] + mat1.m[1][3] * mat2.m[3][2];
+        result.m[1][3] = mat1.m[1][0] * mat2.m[0][3] + mat1.m[1][1] * mat2.m[1][3] + mat1.m[1][2] * mat2.m[2][3] + mat1.m[1][3] * mat2.m[3][3];
+        result.m[2][0] = mat1.m[2][0] * mat2.m[0][0] + mat1.m[2][1] * mat2.m[1][0] + mat1.m[2][2] * mat2.m[2][0] + mat1.m[2][3] * mat2.m[3][0];
+        result.m[2][1] = mat1.m[2][0] * mat2.m[0][1] + mat1.m[2][1] * mat2.m[1][1] + mat1.m[2][2] * mat2.m[2][1] + mat1.m[2][3] * mat2.m[3][1];
+        result.m[2][2] = mat1.m[2][0] * mat2.m[0][2] + mat1.m[2][1] * mat2.m[1][2] + mat1.m[2][2] * mat2.m[2][2] + mat1.m[2][3] * mat2.m[3][2];
+        result.m[2][3] = mat1.m[2][0] * mat2.m[0][3] + mat1.m[2][1] * mat2.m[1][3] + mat1.m[2][2] * mat2.m[2][3] + mat1.m[2][3] * mat2.m[3][3];
+        result.m[3][0] = mat1.m[3][0] * mat2.m[0][0] + mat1.m[3][1] * mat2.m[1][0] + mat1.m[3][2] * mat2.m[2][0] + mat1.m[3][3] * mat2.m[3][0];
+        result.m[3][1] = mat1.m[3][0] * mat2.m[0][1] + mat1.m[3][1] * mat2.m[1][1] + mat1.m[3][2] * mat2.m[2][1] + mat1.m[3][3] * mat2.m[3][1];
+        result.m[3][2] = mat1.m[3][0] * mat2.m[0][2] + mat1.m[3][1] * mat2.m[1][2] + mat1.m[3][2] * mat2.m[2][2] + mat1.m[3][3] * mat2.m[3][2];
+        result.m[3][3] = mat1.m[3][0] * mat2.m[0][3] + mat1.m[3][1] * mat2.m[1][3] + mat1.m[3][2] * mat2.m[2][3] + mat1.m[3][3] * mat2.m[3][3];
+    }
+    else if constexpr (N == 3)
+    {
+        result.m[0][0] = mat1.m[0][0]*mat2.m[0][0] + mat1.m[0][1]*mat2.m[1][0] + mat1.m[0][2]*mat2.m[2][0];
+        result.m[0][1] = mat1.m[0][0]*mat2.m[0][1] + mat1.m[0][1]*mat2.m[1][1] + mat1.m[0][2]*mat2.m[2][1];
+        result.m[0][2] = mat1.m[0][0]*mat2.m[0][2] + mat1.m[0][1]*mat2.m[1][2] + mat1.m[0][2]*mat2.m[2][2];
+
+        result.m[1][0] = mat1.m[1][0]*mat2.m[0][0] + mat1.m[1][1]*mat2.m[1][0] + mat1.m[1][2]*mat2.m[2][0];
+        result.m[1][1] = mat1.m[1][0]*mat2.m[0][1] + mat1.m[1][1]*mat2.m[1][1] + mat1.m[1][2]*mat2.m[2][1];
+        result.m[1][2] = mat1.m[1][0]*mat2.m[0][2] + mat1.m[1][1]*mat2.m[1][2] + mat1.m[1][2]*mat2.m[2][2];
+
+        result.m[2][0] = mat1.m[2][0]*mat2.m[0][0] + mat1.m[2][1]*mat2.m[1][0] + mat1.m[2][2]*mat2.m[2][0];
+        result.m[2][1] = mat1.m[2][0]*mat2.m[0][1] + mat1.m[2][1]*mat2.m[1][1] + mat1.m[2][2]*mat2.m[2][1];
+        result.m[2][2] = mat1.m[2][0]*mat2.m[0][2] + mat1.m[2][1]*mat2.m[1][2] + mat1.m[2][2]*mat2.m[2][2];
+    }
+    else if constexpr (N == 2)
+    {
+        result.m[0][0] = mat1.m[0][0]*mat2.m[0][0] + mat1.m[0][1]*mat2.m[1][0];
+        result.m[0][1] = mat1.m[0][0]*mat2.m[0][1] + mat1.m[0][1]*mat2.m[1][1];
+        result.m[1][0] = mat1.m[1][0]*mat2.m[0][0] + mat1.m[1][1]*mat2.m[1][0];
+        result.m[1][1] = mat1.m[1][0]*mat2.m[0][1] + mat1.m[1][1]*mat2.m[1][1];
+    }
+    else if constexpr (N == 1)
+    {
+        result.m[0][0] = mat1.m[0][0] * mat2.m[0][0];
+    }
+    else
+    {	
+        for (size_t i = 0; i < N; ++i) {
+            for (size_t k = 0; k < N; ++k) {
+                for (size_t j = 0; j < N; ++j) {
+                    result.m[i][j] += mat1.m[i][k] * mat2.m[k][j];
+                }
+            }
+        }
+    }
+    return result;
+}
+template <typename Ty, size_t N>
+[[nodiscard]] constexpr static vec<Ty, N> Multiply_Natively(const vec<Ty, N>& left, const details::TMatrix <Ty, N, N>& mat) noexcept
+{
+    vec<Ty, N> result{};
+    for (size_t i = 0; i < N; ++i) 
+    {
+        Ty sum = Ty(0);
+        for (size_t j = 0; j < N; ++j) 
+        {
+            sum += left.coordinates[j] * mat.m[j][i];
+        }
+        result.coordinates[i] = sum;
+    }
+    return result;
 }
 } // TMatrix namespace details 
 
 template <typename Ty, size_t N>
-[[nodiscard]] constexpr static vec<Ty, N> operator*(const details::TMatrix <Ty, N, N>& mat, const vec<Ty, N>& vec) noexcept;
+[[nodiscard]] constexpr inline vec<Ty, N> Multiply_Natively(const details::TMatrix <Ty, N, N>& mat, const vec<Ty, N>& right) noexcept
+{
+#if defined(__SSE2__)
+    if constexpr (std::is_same_v<Ty, float> && N == 4)
+    {
+        vec<Ty, N> result{};
+        __m128 v = _mm_loadu_ps(&right.coordinates[0]);
+
+        __m128 r0 = _mm_loadu_ps(&mat.m[0][0]);
+        __m128 r1 = _mm_loadu_ps(&mat.m[1][0]);
+        __m128 r2 = _mm_loadu_ps(&mat.m[2][0]);
+        __m128 r3 = _mm_loadu_ps(&mat.m[3][0]);
+
+        __m128 p0 = _mm_mul_ps(r0, v);
+        __m128 p1 = _mm_mul_ps(r1, v);
+        __m128 p2 = _mm_mul_ps(r2, v);
+        __m128 p3 = _mm_mul_ps(r3, v);
+
+         auto horizontal_sum = [](__m128 a) -> float {
+            // a = [a0, a1, a2, a3]; [a1, a0, a3, a2]
+            __m128 t1 = _mm_shuffle_ps(a, a, _MM_SHUFFLE(2, 3, 0, 1));
+            // [a0+a1, a1+a0, a2+a3, a3+a2]
+            __m128 s1 = _mm_add_ps(a, t1);
+            // [s1_1, s1_0, s1_3, s1_2]
+            __m128 t2 = _mm_shuffle_ps(s1, s1, _MM_SHUFFLE(1, 0, 3, 2)); 
+            // 最低位 = s1_0 + s1_1 = 总和
+            __m128 s2 = _mm_add_ss(s1, t2);                               
+            return _mm_cvtss_f32(s2);
+        };
+        result.coordinates[0] = horizontal_sum(p0);
+        result.coordinates[1] = horizontal_sum(p1);
+        result.coordinates[2] = horizontal_sum(p2);
+        result.coordinates[3] = horizontal_sum(p3);
+        return result;
+    }
+    else
+    {
+        return Multiply_Natively(mat, right);
+    }
+#else
+    return Multiply_Natively(mat, right);
+#endif
+    
+   
+}
 template <typename Ty, size_t N>
-[[nodiscard]] constexpr static vec<Ty, N> operator*(const vec<Ty, N>& vec, const details::TMatrix <Ty, N, N>& mat) noexcept;
+[[nodiscard]] constexpr static vec<Ty, N> operator*(const vec<Ty, N>& left, const details::TMatrix <Ty, N, N>& mat) noexcept
+{   
+   
+#if defined(__SSE2__)
+    if constexpr (std::is_same_v<Ty, float> && N == 4) {
+        vec<Ty, N> result{};
+        __m128 v   = _mm_loadu_ps(&left[0]);             // 加载行向量 v = [v0,v1,v2,v3]
+
+        // 加载矩阵的 4 行
+        __m128 r0 = _mm_loadu_ps(&mat.m[0][0]);
+        __m128 r1 = _mm_loadu_ps(&mat.m[1][0]);
+        __m128 r2 = _mm_loadu_ps(&mat.m[2][0]);
+        __m128 r3 = _mm_loadu_ps(&mat.m[3][0]);
+
+        // 转置：将行寄存器变为列寄存器
+        _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
+        // 现在 r0 = 原第 0 列，r1 = 原第 1 列，r2 = 原第 2 列，r3 = 原第 3 列
+
+        // 水平求和辅助函数（与 mat*vec 中的相同）
+        auto horizontal_sum = [](__m128 a) -> float {
+            __m128 t1 = _mm_shuffle_ps(a, a, _MM_SHUFFLE(2, 3, 0, 1));
+            __m128 s1 = _mm_add_ps(a, t1);
+            __m128 t2 = _mm_shuffle_ps(s1, s1, _MM_SHUFFLE(1, 0, 3, 2));
+            __m128 s2 = _mm_add_ss(s1, t2);
+            return _mm_cvtss_f32(s2);
+        };
+
+        // 逐列点积并存储结果
+        result[0] = horizontal_sum(_mm_mul_ps(v, r0));
+        result[1] = horizontal_sum(_mm_mul_ps(v, r1));
+        result[2] = horizontal_sum(_mm_mul_ps(v, r2));
+        result[3] = horizontal_sum(_mm_mul_ps(v, r3));
+        return result;
+    }
+    else {
+        return Multiply_Natively(left, mat);
+    }
+#else
+    return Multiply_Natively(left, mat);
+#endif
+}
 
 template <typename Ty, size_t N>
-constexpr static details::TMatrix <Ty, N, N> perspective(Ty fov, Ty aspect, Ty near, Ty far) noexcept;
-
-template <typename Ty, size_t N>
-constexpr static details::TMatrix <Ty, N, N> translate(Ty x, Ty y, Ty z) noexcept;
+constexpr static details::TMatrix<Ty, N, N> perspective(Ty fov, Ty aspect, Ty near, Ty far) noexcept;
 
 
+namespace details
+{
 /**
  * @about 旋转矩阵: 
  * >    在 N 维空间中, 旋转是一个保持原点不变, 保距且行列式为 1 的线性变换. 
@@ -2241,17 +2297,121 @@ constexpr static details::TMatrix <Ty, N, N> translate(Ty x, Ty y, Ty z) noexcep
  * @brief 获取 N 维 旋转矩阵
  * @param InputIter 是一个输入迭代器, 其值类型为 rotate2d, 用于指定每个平面旋转的参数.
  */
-template <typename Ty, size_t N, typename InputIter>
-constexpr static details::TMatrix <Ty, N, N> rotate(InputIter first, InputIter last) noexcept
+template <typename Ty>
+constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty angle, Ty x, Ty y, Ty z) noexcept
 {
-	details::TMatrix <Ty, N, N> idt = details::TMatrix<Ty, N, N>::identity();
-	for (; first != last; ++first) 
-	{
-		auto [i, j, angle] = *first;
-		idt = idt.multiply(details::TMatrix<Ty, N, N>::rotate({i, j, angle}));
-	}
-	return idt;
+    static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+    TMatrix<Ty, 3, 3> result = TMatrix<Ty, 3, 3>::identity();
+
+    // 归一化旋转轴
+    Ty len = std::sqrt(x*x + y*y + z*z);
+    // 零轴, 返回单位矩阵
+    if (len < epsilon) {
+        return result;   
+    }
+    x /= len;
+    y /= len;
+    z /= len;
+
+    Ty c = std::cos(angle);
+    Ty s = std::sin(angle);
+    Ty t = Ty(1) - c;
+
+    // 罗德里格斯公式展开
+    result.m[0][0] = x * x * t + c;
+    result.m[0][1] = x * y * t - z * s;
+    result.m[0][2] = x * z * t + y * s;
+
+    result.m[1][0] = y * x * t + z * s;
+    result.m[1][1] = y * y * t + c;
+    result.m[1][2] = y * z * t - x * s;
+
+    result.m[2][0] = z * x * t - y * s;
+    result.m[2][1] = z * y * t + x * s;
+    result.m[2][2] = z * z * t + c;
+
+    return result;
 }
+
+template <typename Ty>
+constexpr static TMatrix<Ty, 4, 4> Get_Rotate4D_Matrix(Ty angle, Ty x, Ty y, Ty z, Ty w) noexcept
+{
+    static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
+    (void)w;
+    TMatrix<Ty, 4, 4> result = TMatrix<Ty, 4, 4>::identity();
+
+    // 归一化旋转轴
+    Ty len = std::sqrt(x*x + y*y + z*z);
+    // 零轴, 返回单位矩阵
+    if (len < epsilon) {
+        return result;   
+    }
+    x /= len;
+    y /= len;
+    z /= len;
+
+    Ty c = std::cos(angle);
+    Ty s = std::sin(angle);
+    Ty t = Ty(1) - c;
+
+    // 罗德里格斯公式展开
+    result.m[0][0] = x * x * t + c;
+    result.m[0][1] = x * y * t - z * s;
+    result.m[0][2] = x * z * t + y * s;
+
+    result.m[1][0] = y * x * t + z * s;
+    result.m[1][1] = y * y * t + c;
+    result.m[1][2] = y * z * t - x * s;
+
+    result.m[2][0] = z * x * t - y * s;
+    result.m[2][1] = z * y * t + x * s;
+    result.m[2][2] = z * z * t + c;
+
+    return result;
+}
+
+
+template <typename Ty, size_t N>
+constexpr static details::TMatrix<Ty, N, N> Get_Translation_Matrix(const Ty (&offset)[N]) noexcept
+{
+    auto result = details::TMatrix<Ty, N, N>::identity();
+    if constexpr (N == 4)
+    {
+        result.m[0][3] = offset[0];
+        result.m[1][3] = offset[1];
+        result.m[2][3] = offset[2];
+    }
+    else
+    {
+        for (size_t i = 0; i < N-1; ++i) {
+            result.m[i][N-1] = offset[i];
+        }
+    }
+    return result;
+}
+template <typename Ty, size_t N>
+constexpr static details::TMatrix<Ty, N, N> Get_Translation_Matrix(const vec<Ty, N>& offset) noexcept
+{
+    return Get_Translation_Matrix(offset.coordinates);
+}
+}
+/**
+ * @brief 将输入 mat 进行平移变换, 返回一个新的矩阵:
+ */
+template <typename Ty, size_t N>
+constexpr static details::TMatrix<Ty, N, N> translate(details::TMatrix<Ty, N, N> mat, const Ty (&offset)[N]) noexcept
+{
+    return mat.multiply(details::Get_Translation_Matrix(offset));
+}
+template <typename Ty, size_t N>
+constexpr static details::TMatrix<Ty, N, N> translate(details::TMatrix<Ty, N, N> mat, const vec<Ty, N>& offset) noexcept
+{
+    return mat.multiply(details::Get_Translation_Matrix(offset));
+}
+
+
+
+
 
 template <typename Ty, typename... Args>
 constexpr inline details::TMatrix<Ty, sizeof...(Args), sizeof...(Args)> scale(Args... args) noexcept
@@ -2279,43 +2439,83 @@ constexpr inline details::TMatrix<Ty, N, N> Scale_Impl(const std::array<Ty, N>& 
 {
 	return scale<Ty>(factors[Is]...);
 }
-}
+
 /**
  * @biref 获取 N 维 缩放矩阵: 缩放矩阵是一个对角矩阵, 第 i 个对角元为第 i 轴的缩放因子
  * @param factors C-style 缩放因子, 用于指定对应轴的缩放因子
  */ 
 template <typename Ty, size_t N>
-constexpr inline details::TMatrix<Ty, N, N> scale(const Ty (&factors)[N]) noexcept
+constexpr inline details::TMatrix<Ty, N, N> Get_Scaling_Matrix(const Ty (&factors)[N]) noexcept
 {
 	return details::Scale_Impl<Ty>(factors, std::make_index_sequence<N>{});
 }
 
 template <typename Ty, size_t N>
-constexpr inline details::TMatrix<Ty, N, N> scale(const std::array<Ty, N>& factors) noexcept
+constexpr inline details::TMatrix<Ty, N, N> Get_Scaling_Matrix(const vec<Ty, N>& factors) noexcept
 {
-	return details::Scale_Impl<Ty>(factors, std::make_index_sequence<N>{});
+	return Get_Scaling_Matrix(factors.coordinates);
+}
+}
+
+/**
+ * @brief 将输入 mat 进行缩放变换, 返回一个新的矩阵:
+ * @param factors C-style 缩放因子, 用于指定对应轴的缩放因子
+ */
+template <typename Ty, size_t N>
+constexpr inline details::TMatrix<Ty, N, N> scale(details::TMatrix<Ty, N, N> mat, const vec<Ty, N>& factors) noexcept
+{
+    return mat.multiply(details::Get_Scaling_Matrix(factors));
 }
 
 template <typename Ty, size_t N>
-constexpr inline details::TMatrix<Ty, N, N> scale(const vec<Ty, N>& factors) noexcept
+constexpr inline details::TMatrix<Ty, N, N> scale(details::TMatrix<Ty, N, N> mat, const Ty (&factors)[N]) noexcept
 {
-	return scale(factors.coordinates);
+	return mat * details::Get_Scaling_Matrix(factors);
 }
 
+template <typename Ty, size_t N>
+details::TMatrix<Ty, N, N> operator+(const details::TMatrix <Ty, N, N> lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept
+{
+    details::TMatrix<Ty, N, N> result = details::TMatrix<Ty, N, N>::zero();
+    std::transform(&lhs.m[0][0], &lhs.m[0][0] + N*N, &rhs.m[0][0], &result.m[0][0], std::plus<>{});
+    return result;
+}
+template <typename Ty, size_t N>
+details::TMatrix <Ty, N, N> operator+(Ty lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept
+{
+    details::TMatrix<Ty, N, N> result = details::TMatrix<Ty, N, N>::zero();
+    std::for_each(&rhs.m[0][0], &rhs.m[0][0] + N*N, [lhs](Ty& v){ v += lhs; });
+    return result;
+}
+template <typename Ty, size_t N>
+details::TMatrix <Ty, N, N> operator+(const details::TMatrix <Ty, N, N> lhs, Ty rhs) noexcept
+{
+    details::TMatrix<Ty, N, N> result = details::TMatrix<Ty, N, N>::zero();
+    std::for_each(&lhs.m[0][0], &lhs.m[0][0] + N*N, [rhs](Ty& v){ v += rhs; });
+    return result;
+}
 
 template <typename Ty, size_t N>
-details::TMatrix <Ty, N, N> operator+(const details::TMatrix <Ty, N, N> lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept;
+details::TMatrix <Ty, N, N> operator-(const details::TMatrix <Ty, N, N> lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept
+{
+    details::TMatrix<Ty, N, N> result = details::TMatrix<Ty, N, N>::zero();
+    std::transform(&lhs.m[0][0], &lhs.m[0][0] + N*N, &rhs.m[0][0], &result.m[0][0], std::minus<>{});
+    return result;
+}
 template <typename Ty, size_t N>
-details::TMatrix <Ty, N, N> operator+(Ty lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept;
+details::TMatrix <Ty, N, N> operator-(Ty lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept
+{
+    details::TMatrix<Ty, N, N> result = details::TMatrix<Ty, N, N>::zero();
+    std::for_each(&rhs.m[0][0], &rhs.m[0][0] + N*N, [lhs](Ty& v){ v = lhs - v; });
+    return result;
+}
 template <typename Ty, size_t N>
-details::TMatrix <Ty, N, N> operator+(const details::TMatrix <Ty, N, N> lhs, Ty rhs) noexcept;
-
-template <typename Ty, size_t N>
-details::TMatrix <Ty, N, N> operator-(const details::TMatrix <Ty, N, N> lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept;
-template <typename Ty, size_t N>
-details::TMatrix <Ty, N, N> operator-(Ty lhs, const details::TMatrix <Ty, N, N>& rhs) noexcept;
-template <typename Ty, size_t N>
-details::TMatrix <Ty, N, N> operator-(const details::TMatrix <Ty, N, N> lhs, Ty rhs) noexcept;
+details::TMatrix <Ty, N, N> operator-(const details::TMatrix <Ty, N, N> lhs, Ty rhs) noexcept
+{
+    details::TMatrix<Ty, N, N> result = details::TMatrix<Ty, N, N>::zero();
+    std::for_each(&lhs.m[0][0], &lhs.m[0][0] + N*N, [rhs](Ty& v){ v -= rhs; });
+    return result;
+}
 
 
 

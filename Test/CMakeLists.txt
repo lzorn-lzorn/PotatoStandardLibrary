@@ -16,7 +16,7 @@ foreach(test_source IN LISTS POTATO_STANDARD_TEST_SOURCES)
     string(REGEX REPLACE "[/\\\\.]" "_" test_target "${test_relative_path}")
 
     add_executable(${test_target} "${test_source}")
-    target_link_libraries(${test_target} PRIVATE PotatoStandard::PotatoStandard)
+    target_link_libraries(${test_target} PRIVATE Core::Core)
     target_compile_features(${test_target} PRIVATE cxx_std_20)
 
     add_test(NAME ${test_target} COMMAND ${test_target})
