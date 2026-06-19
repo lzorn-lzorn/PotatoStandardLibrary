@@ -1860,7 +1860,8 @@ struct TMatrix <Ty, N, N>
 	{
 		return self_type{};
 	}
-	constexpr static self_type one() noexcept {
+	constexpr static self_type one() noexcept 
+    {
 		self_type m{};
 		for (auto& row : m.m) 
         {
@@ -1868,6 +1869,22 @@ struct TMatrix <Ty, N, N>
         }
 		return m;
 	}
+
+    static self_type random(Ty left, Ty right) noexcept
+    {
+        self_type result{};
+        std::uniform_real_distribution<Ty> dist(left, right);
+        for (size_t i = 0; i < N; ++i)
+        {
+            for (size_t j = 0; j < N; ++j)
+            {
+                result.m[i][j] = dist(get_rng());
+            }
+        }
+                
+        return result;
+    }
+    
 	static self_type fill(self_type& mat, Ty value) noexcept 
 	{
 		for (auto& row : mat.m) 
@@ -2056,7 +2073,7 @@ struct TMatrix <Ty, N, N>
 private:
 	self_type& Multiply_Natively(const self_type& rhs) noexcept
 	{
-		return multiply(*this, rhs);
+		return Multiply_Natively(*this, rhs);
 	}
 	self_type& Transpose_Natively() noexcept
 	{
@@ -2613,9 +2630,6 @@ inline auto lerp(const vec<typename Vec::value_type, N>& a,
 }
 
 }
-
-
-
 
 
 #if defined(__cpp_lib_isclose) && __cpp_lib_isclose >= 202207L
