@@ -1762,16 +1762,87 @@ constexpr static TMatrix<Ty, 4, 4> Get_Rotate4D_Matrix(Ty angle, Ty x, Ty y, Ty 
 template <typename Ty>
 constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty angle, Ty x, Ty y, Ty z) noexcept;
 
+template <typename Ty, size_t Rows, size_t Cols>
+[[maybe_unused]] inline TMatrix <Ty, Cols, Rows> Transpose_Natively(TMatrix <Ty, Rows, Cols>& mat) noexcept;
+
+template <typename Ty, size_t Rows, size_t Cols>
+inline TMatrix<Ty, Rows, Cols> Random_Matrix(Ty left, Ty right) noexcept;
+
+template <typename Ty, size_t Rows, size_t Cols>
+[[maybe_unused]] inline TMatrix<Ty, Rows, Cols> Fill_Matrix_With(TMatrix<Ty, Rows, Cols>& mat, Ty value) noexcept;
+
+template <typename Ty, size_t N>
+[[nodiscard]] constexpr inline TMatrix <Ty, N, N> Multiply_Natively(const TMatrix <Ty, N, N>& mat1, const TMatrix <Ty, N, N>& mat2) noexcept;
+
+template <typename Ty, size_t Cols, size_t Middle, size_t Rows>
+[[nodiscard]] constexpr inline TMatrix <Ty, Cols, Rows> Multiply_Natively(const TMatrix <Ty, Cols, Middle>& mat1, const TMatrix <Ty, Middle, Rows>& mat2) noexcept;
+
+template <typename Ty, size_t N>
+[[nodiscard]] constexpr inline vec<Ty, N> Multiply_Natively(const details::TMatrix <Ty, N, N>& mat, const vec<Ty, N>& right) noexcept;
+
+template <typename Ty, size_t Rows, size_t Cols>
+[[nodiscard]] constexpr inline vec<Ty, Rows> Multiply_Natively(const vec<Ty, Rows>& left, const details::TMatrix <Ty, Rows, Cols>& mat) noexcept;
+
 // 默认行主序
-template <typename Ty, size_t Row, size_t Col>
+template <typename Ty, size_t Rows, size_t Cols>
 struct TMatrix 
 {
 	using value_type = Ty;
+    using self_type = TMatrix<Ty, Rows, Cols>;
 
-	constexpr static size_t rows = Row;
-	constexpr static size_t cols = Col;
+	constexpr static size_t rows = Rows;
+	constexpr static size_t cols = Cols;
 
-	Ty m[Row][Col];
+	std::array<std::array<Ty, rows>, cols> m;
+
+    constexpr static self_type zero() noexcept
+	{
+		return self_type{};
+	}
+	constexpr static self_type one() noexcept 
+    {
+		self_type m{};
+		return  Fill_Matrix_With(m, 1);
+	}
+
+    static self_type random(Ty left, Ty right) noexcept
+    {
+        return Random_Matrix(left, right);
+    }
+    template <size_t NewRows, size_t NewCols>
+        requires (NewCols == Cols)
+    TMatrix<Ty, Rows, NewCols> multiply(const TMatrix<Ty, NewRows, NewCols> rhs)
+    {
+        return Multiply_Natively<Ty, Rows, NewCols, NewCols>(*this, rhs);
+    }
+
+    vec<Ty, Rows> as_vector() requires (Cols == 1) 
+    {
+        vec<Ty, Rows> result;
+        for (size_t i = 0; i < Rows; ++i)
+        {
+            result[i] = m[i][0];
+        }
+        return result;
+    }
+
+    vec<Ty, Cols> as_vector() requires (Rows == 1) 
+    {
+        vec<Ty, Cols> result;
+        for (size_t j = 0; j < Cols; ++j)
+        {
+            result[j] = m[0][j];
+        }
+        return result;
+    }
+
+    self_type inverse() noexcept = delete;
+    double det() noexcept = delete;
+
+	constexpr bool is_invertible() noexcept
+    {
+        return false;
+    }
 };
 
 template <typename Ty, size_t N>
@@ -1863,39 +1934,18 @@ struct TMatrix <Ty, N, N>
 	constexpr static self_type one() noexcept 
     {
 		self_type m{};
-		for (auto& row : m.m) 
-        {
-            row.fill(Ty(1));
-        }
-		return m;
+		return  Fill_Matrix_With(m, 1);
 	}
 
     static self_type random(Ty left, Ty right) noexcept
     {
-        self_type result{};
-        std::uniform_real_distribution<Ty> dist(left, right);
-        for (size_t i = 0; i < N; ++i)
-        {
-            for (size_t j = 0; j < N; ++j)
-            {
-                result.m[i][j] = dist(get_rng());
-            }
-        }
-                
-        return result;
+        return Random_Matrix<Ty, N, N>(left, right);
     }
     
-	static self_type fill(self_type& mat, Ty value) noexcept 
-	{
-		for (auto& row : mat.m) 
-		{
-			std::fill(row.begin(), row.end(), value);
-		}
-		return mat;
-	}
 	self_type& fill_with(Ty value) noexcept
 	{
-		return fill(*this, value);
+        Fill_Matrix_With(*this, value);
+		return *this;
 	}
 	
 	self_type& operator+=(const self_type& rhs) noexcept 
@@ -1960,11 +2010,13 @@ struct TMatrix <Ty, N, N>
 		}
 		else 
 		{
-			return Multiply_Natively(rhs);
+            *this = Multiply_Natively(*this, rhs);
+			return *this;
 		}
 		
 	#else
-		return Multiply_Natively(rhs);
+        *this = Multiply_Natively(*this, rhs);
+		return *this;
 	#endif
 		
 		
@@ -1988,10 +2040,12 @@ struct TMatrix <Ty, N, N>
 		}
 		else
 		{
-			return Transpose_Natively();
+            Transpose_Natively(*this);
+			return *this;
 		}
 	#endif
-		return Transpose_Natively();
+        Transpose_Natively(*this);
+		return *this;
 	}
 
    
@@ -2070,46 +2124,6 @@ struct TMatrix <Ty, N, N>
 			return det;
 		}
 	}
-private:
-	self_type& Multiply_Natively(const self_type& rhs) noexcept
-	{
-		return Multiply_Natively(*this, rhs);
-	}
-	self_type& Transpose_Natively() noexcept
-	{
-		if constexpr (N == 1)
-		{
-			return *this;
-		}
-		else if constexpr (N == 2)
-		{
-			std::swap(m[0][1], m[1][0]);
-		}
-		else if constexpr (N == 3)
-		{
-			std::swap(m[0][1], m[1][0]);
-			std::swap(m[0][2], m[2][0]);
-			std::swap(m[1][2], m[2][1]);
-		}
-		else if constexpr (N == 4)
-		{
-			std::swap(m[0][1], m[1][0]);
-			std::swap(m[0][2], m[2][0]);
-			std::swap(m[0][3], m[3][0]);
-			std::swap(m[1][2], m[2][1]);
-			std::swap(m[1][3], m[3][1]);
-			std::swap(m[2][3], m[3][2]);
-		}
-		else
-		{
-			for (size_t i = 0; i < N; ++i) {
-				for (size_t j = i + 1; j < N; ++j) {
-					std::swap(m[i][j], m[j][i]);
-				}
-			}
-		}
-		return *this;
-	}
 };
 
 template <typename Ty, size_t N>
@@ -2125,8 +2139,66 @@ constexpr static TMatrix <Ty, N, N> Givens_Matrix(size_t i, size_t j, Ty angle) 
 	m.m[j][j] = c;
 	return m;
 }
+
+template <typename Ty, size_t Rows, size_t Cols>
+[[maybe_unused]] inline TMatrix<Ty, Rows, Cols> Fill_Matrix_With(TMatrix<Ty, Rows, Cols>& mat, Ty value) noexcept 
+{
+    for (auto& row : mat.m) 
+    {
+        std::fill(row.begin(), row.end(), value);
+    }
+    return mat;
+}
+
+
+template <typename Ty, size_t Rows, size_t Cols>
+inline TMatrix<Ty, Rows, Cols> Random_Matrix(Ty left, Ty right) noexcept
+{
+    TMatrix<Ty, Rows, Cols> result{};
+    std::uniform_real_distribution<Ty> dist(left, right);
+    for (size_t i = 0; i < Rows; ++i)
+    {
+        for (size_t j = 0; j < Cols; ++j)
+        {
+            result.m[i][j] = dist(get_rng());
+        }
+    }
+            
+    return result;
+}
+
+template <typename Ty, size_t Rows, size_t Cols>
+[[maybe_unused]] inline TMatrix <Ty, Cols, Rows> Transpose_Natively(TMatrix <Ty, Rows, Cols>& mat) noexcept
+{
+    for (size_t i = 0; i < Rows; ++i) 
+    {
+        for (size_t j = i + 1; j < Cols; ++j) 
+        {
+            std::swap(mat.m[i][j], mat.m[j][i]);
+        }
+    }
+    return mat;
+}
+
+template <typename Ty, size_t Cols, size_t Middle, size_t Rows>
+[[nodiscard]] constexpr inline TMatrix <Ty, Cols, Rows> Multiply_Natively(const TMatrix <Ty, Cols, Middle>& mat1, const TMatrix <Ty, Middle, Rows>& mat2) noexcept
+{
+    TMatrix <Ty, Cols, Rows> result = zero();
+    for (size_t i = 0; i < Cols; ++i) 
+    {
+        for (size_t k = 0; k < Middle; ++k) 
+        {
+            Ty temp = mat1.m[i][k];
+            for (size_t j = 0; j < Rows; ++j) 
+            {
+                result.m[i][j] += temp * mat2.m[k][j];
+            }
+        }
+    }
+}
+
 template <typename Ty, size_t N>
-TMatrix <Ty, N, N> Multiply_Natively(const TMatrix <Ty, N, N>& mat1, const TMatrix <Ty, N, N>& mat2) noexcept
+[[nodiscard]] constexpr inline TMatrix <Ty, N, N> Multiply_Natively(const TMatrix <Ty, N, N>& mat1, const TMatrix <Ty, N, N>& mat2) noexcept
 {
 	TMatrix <Ty, N, N> result = zero();
     if constexpr (N == 4)
@@ -2175,24 +2247,29 @@ TMatrix <Ty, N, N> Multiply_Natively(const TMatrix <Ty, N, N>& mat1, const TMatr
     }
     else
     {	
-        for (size_t i = 0; i < N; ++i) {
-            for (size_t k = 0; k < N; ++k) {
-                for (size_t j = 0; j < N; ++j) {
-                    result.m[i][j] += mat1.m[i][k] * mat2.m[k][j];
+        for (size_t i = 0; i < N; ++i) 
+        {
+            for (size_t k = 0; k < N; ++k) 
+            {
+                Ty temp = mat1.m[i][k];
+                for (size_t j = 0; j < N; ++j) 
+                {
+                    result.m[i][j] += temp * mat2.m[k][j];
                 }
             }
         }
     }
     return result;
 }
-template <typename Ty, size_t N>
-[[nodiscard]] constexpr static vec<Ty, N> Multiply_Natively(const vec<Ty, N>& left, const details::TMatrix <Ty, N, N>& mat) noexcept
+
+template <typename Ty, size_t Rows, size_t Cols>
+[[nodiscard]] constexpr inline vec<Ty, Rows> Multiply_Natively(const vec<Ty, Rows>& left, const details::TMatrix <Ty, Rows, Cols>& mat) noexcept
 {
-    vec<Ty, N> result{};
-    for (size_t i = 0; i < N; ++i) 
+    vec<Ty, Rows> result{};
+    for (size_t i = 0; i < Rows; ++i) 
     {
         Ty sum = Ty(0);
-        for (size_t j = 0; j < N; ++j) 
+        for (size_t j = 0; j < Cols; ++j) 
         {
             sum += left.coordinates[j] * mat.m[j][i];
         }
@@ -2465,15 +2542,12 @@ constexpr static details::TMatrix<Ty, N, N> translate(details::TMatrix<Ty, N, N>
 {
     return mat.multiply(details::Get_Translation_Matrix(offset));
 }
+
 template <typename Ty, size_t N>
 constexpr static details::TMatrix<Ty, N, N> translate(details::TMatrix<Ty, N, N> mat, const vec<Ty, N>& offset) noexcept
 {
     return mat.multiply(details::Get_Translation_Matrix(offset));
 }
-
-
-
-
 
 template <typename Ty, typename... Args>
 constexpr inline details::TMatrix<Ty, sizeof...(Args), sizeof...(Args)> scale(Args... args) noexcept
@@ -2491,6 +2565,7 @@ constexpr inline details::TMatrix<Ty, sizeof...(Args), sizeof...(Args)> scale(Ar
 
 namespace details
 {
+    
 template <typename Ty, size_t N, size_t... Is>
 constexpr inline details::TMatrix<Ty, N, N> Scale_Impl(const Ty (&factors)[N], std::index_sequence<Is...>) noexcept
 {
