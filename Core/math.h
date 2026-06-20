@@ -597,6 +597,101 @@ inline vec<Ty, N> operator/(const vec<Ty, N>& v, const Ty s) noexcept
     return result;
 }
 
+inline bool is_parallel(const vec3f& a, const vec3f& b, float eps = tiny) noexcept 
+{
+    return approx_zero(vec3f::cross(a, b).length(), eps);
+}
+
+inline bool is_parallel(const vec2f& a, const vec2f& b, float eps = tiny) noexcept 
+{
+    return approx_zero(vec2f::cross(a, b), eps);
+}
+
+inline bool is_vertical(const vec3f& a, const vec3f& b, float eps = tiny) noexcept 
+{
+    return approx_zero(a.dot(b), eps);
+}
+
+inline bool is_vertical(const vec2f& a, const vec2f& b, float eps = tiny) noexcept 
+{
+    return approx_zero(a.dot(b), eps);
+}
+
+inline bool in_same_direction(const vec2f& a, const vec2f& b, float eps = tiny) noexcept 
+{
+    return a.dot(b) > 0 && is_parallel(a, b, eps);
+}
+
+inline bool in_same_direction(const vec3f& a, const vec3f& b, float eps = tiny) noexcept 
+{
+    return a.dot(b) > 0 && is_parallel(a, b, eps);
+}
+
+inline bool in_opposite_direction(const vec2f& a, const vec2f& b, float eps = tiny) noexcept 
+{
+    return a.dot(b) < 0 && is_parallel(a, b, eps);
+}
+
+inline bool in_opposite_direction(const vec3f& a, const vec3f& b, float eps = tiny) noexcept 
+{
+    return a.dot(b) < 0 && is_parallel(a, b, eps);
+}
+
+inline bool is_collinear(vec3f point, vec3f line_start, vec3f line_end, float eps = tiny) noexcept 
+{
+    return is_parallel(line_end - line_start, point - line_start, eps);
+}
+
+inline bool is_collinear(vec2f point, vec2f line_start, vec2f line_end, float eps = tiny) noexcept 
+{
+    return is_parallel(line_end - line_start, point - line_start, eps);
+}
+
+inline bool is_between(float point, float lower_bound, float upper_bound) noexcept 
+{
+    return point >= lower_bound && point <= upper_bound;
+}
+
+inline bool is_between(vec2f point, vec2f lower_bound, vec2f upper_bound) noexcept 
+{
+    return is_between(point.x(), lower_bound.x(), upper_bound.x()) && 
+           is_between(point.y(), lower_bound.y(), upper_bound.y());
+}
+
+inline bool is_between(vec3f point, vec3f lower_bound, vec3f upper_bound) noexcept 
+{
+    return is_between(point.x(), lower_bound.x(), upper_bound.x()) && 
+           is_between(point.y(), lower_bound.y(), upper_bound.y()) &&
+           is_between(point.z(), lower_bound.z(), upper_bound.z());
+}
+
+inline float distance(vec2f p1, vec2f p2) noexcept 
+{
+    return (p1 - p2).length();
+}
+
+inline float distance(vec3f p1, vec3f p2) noexcept 
+{
+    return (p1 - p2).length();
+}
+
+inline float radians(vec2f p1, vec2f p2) noexcept
+{
+    float dot_product = p1.dot(p2);
+    float lengths_product = p1.length() * p2.length();
+    if (lengths_product == 0.0f) 
+    {
+        return 0.0f;
+    }
+    float cos_angle = std::clamp(dot_product / lengths_product, -1.0f, 1.0f);
+    return std::acos(cos_angle);
+}
+
+inline float angle(vec2f p1, vec2f p2) noexcept
+{
+    return radians(p1, p2) * math::rad2deg;
+}
+
 } // namespace core::math vec end ==============================================
 
 namespace core::math
@@ -1738,7 +1833,6 @@ namespace details
 {
 
 
-
 /// 2D 旋转矩阵（Givens 旋转）
 template <typename Ty, size_t N>
 	requires std::is_arithmetic_v<Ty> && (N >= 2)
@@ -2752,3 +2846,260 @@ namespace core::math
     }
 }
 #endif
+
+
+
+
+namespace core::geometry
+{
+using point2d = math::vec2f;
+using point3d = math::vec3f;
+
+struct circle;
+struct line3d;
+struct line2d;
+struct triangle;
+struct sphere;
+struct standing_rectangle;
+struct standing_cube;
+struct standing_cylinder;
+struct capsule;
+struct cube;
+struct cylinder;
+
+struct line2d
+{
+    point2d start;
+    point2d end;
+
+    /**
+     * @brief 判断点是否在线段上
+     * @param point 待判断的点
+     * @param inclusive 是否包含端点, true 则只计算 start 和 end 之间; false 则仅计算是否共线
+     */
+    bool contains(point2d point, bool inclusive = false) const noexcept
+    {
+        return math::is_collinear(point, start, end) && 
+            (inclusive ? math::is_between(point, start, end) : true);
+    }
+
+    float length() const noexcept
+    {
+        return math::distance(start, end);
+    }
+
+    float angle() const noexcept
+    {
+        return math::angle(start, end);
+    }
+
+    float radians() const noexcept
+    {
+        return math::radians(start, end);
+    }
+
+};
+
+struct line3d
+{
+    point3d start;
+    point3d end;
+
+    /**
+     * @brief 判断点是否在线段上
+     * @param point 待判断的点
+     * @param inclusive 是否包含端点, true 则只计算 start 和 end 之间; false 则仅计算是否共线
+     */
+    bool contains(point3d point, bool inclusive = false) const noexcept
+    {
+        return math::is_collinear(point, start, end) && 
+            (inclusive ? math::is_between(point, start, end) : true);
+    }
+
+    float length() const noexcept
+    {
+        return math::distance(start, end);
+    }
+};
+
+
+inline bool is_point_in_circle(point2d point, circle c) noexcept;
+struct circle 
+{
+    point2d center;
+    float radius;
+
+    /**
+     * @brief 判断点是否在圆内
+     * @param point 待判断的点
+     */
+    bool contains(point2d point) const noexcept
+    {
+        return is_point_in_circle(point, *this);
+    }
+};
+
+inline bool is_point_in_circle(point2d point, circle c) noexcept
+{
+    float dx = point.x() - c.center.x();
+    float dy = point.y() - c.center.y();
+    return (dx * dx + dy * dy) <= (c.radius * c.radius);
+}
+struct standing_rectangle
+{
+    point2d position; // 左下角坐标
+    point2d size;     // 宽度和高度
+    bool contains(point2d point) const noexcept {
+        return point.x() >= position.x() &&
+               point.x() <= position.x() + size.x() &&
+               point.y() >= position.y() &&
+               point.y() <= position.y() + size.y();
+    }
+};
+
+struct triangle
+{
+    point2d p1;
+    point2d p2;
+    point2d p3;
+
+    /**
+     * @brief 重心坐标是点相对于三角形顶点的线性组合系数, 可以用来判断点在三角形内的位置关系.
+     * @param p 待计算重心坐标的点
+     * @return 返回重心坐标 (alpha, beta, gamma)
+     */
+    point3d barycentric(point2d p) const noexcept
+    {
+        float v0x = p2.x() - p1.x(), v0y = p2.y() - p1.y();
+        float v1x = p3.x() - p1.x(), v1y = p3.y() - p1.y();
+        float v2x = p.x()  - p1.x(), v2y = p.y()  - p1.y();
+
+        float d00 = v0x * v0x + v0y * v0y;
+        float d01 = v0x * v1x + v0y * v1y;
+        float d11 = v1x * v1x + v1y * v1y;
+        float d20 = v2x * v0x + v2y * v0y;
+        float d21 = v2x * v1x + v2y * v1y;
+
+        float denom = d00 * d11 - d01 * d01;
+
+        // 退化三角形 (面积接近 0)
+        if (std::abs(denom) < 1e-12f)
+        {
+            return {1.0f, 0.0f, 0.0f}; // 可任意返回，这里默认落在 p1
+        }
+            
+        float inv_denom = 1.0f / denom;
+        float beta  = (d11 * d20 - d01 * d21) * inv_denom;
+        float gamma = (d00 * d21 - d01 * d20) * inv_denom;
+        float alpha = 1.0f - beta - gamma;
+
+        return {alpha, beta, gamma};
+    }
+
+    bool contains(point2d point) const noexcept
+    {
+        point3d bary = barycentric(point);
+        return bary.x() >= -math::tiny && bary.y() >= -math::tiny && bary.z() >= -math::tiny;
+    }
+};
+
+/**
+ * @brief 在三角形内插值, 根据点的重心坐标计算对应的 y 值
+ * @param tri 三角形
+ * @param point 待插值的点
+ * @param v1, v2, v3 分别对应三角形三个顶点的属性值
+ * @return 返回插值结果   
+ */
+template<typename Ty>
+inline Ty interpolate(const triangle& tri, math::vec2f point, Ty v1, Ty v2, Ty v3) noexcept
+{
+    auto [alpha, beta, gamma] = tri.barycentric(point).coordinates;
+    return alpha * v1 + beta * v2 + gamma * v3;
+}
+
+struct sphere
+{
+    point3d center; // 中心坐标
+    float radius;       // 半径
+
+    bool contains(point3d point) const noexcept
+    {
+        float dx = point.x() - center.x();
+        float dy = point.y() - center.y();
+        float dz = point.z() - center.z();
+        return (dx * dx + dy * dy + dz * dz) <= (radius * radius);
+    }
+};
+
+struct standing_cube
+{
+    point3d position; // 左下角坐标
+    point3d size;     // 宽度、高度和深度
+
+    bool contains(point3d point) const noexcept
+    {
+        return point.x() >= position.x() &&
+               point.x() <= position.x() + size.x() &&
+               point.y() >= position.y() &&
+               point.y() <= position.y() + size.y() &&
+               point.z() >= position.z() &&
+               point.z() <= position.z() + size.z();
+    }
+};
+
+inline bool is_point_in_cylinder(point3d point, standing_cylinder c) noexcept;
+struct standing_cylinder
+{
+    point3d base_center; // 底面圆心坐标
+    float radius;        // 半径
+    float height;        // 高度
+
+    bool contains(point3d point) const noexcept
+    {
+        is_point_in_cylinder(point, *this);
+    }
+};
+
+inline bool is_point_in_cylinder(point3d point, standing_cylinder c) noexcept
+{
+    bool is_in_base_circle = is_point_in_circle(
+        {point.x(), point.z()}, 
+        {{c.base_center.x(), c.base_center.z()}, c.radius}
+    );
+    bool is_in_height = point.y() >= c.base_center.y() && point.y() <= c.base_center.y() + c.height;
+    return is_in_base_circle && is_in_height;
+}
+struct standing_capsule
+{
+    point3d bottom_point; // 底面圆心坐标
+    point3d top_point; // 顶面圆心坐标
+    float radius;   // 半径
+
+    bool contains(point3d point) const noexcept
+    {
+       return is_point_in_cylinder(
+               point,
+               {bottom_point, radius, std::abs(top_point.z() - bottom_point.z())}
+           ) ||
+           sphere{bottom_point, radius}.contains(point) ||
+           sphere{top_point, radius}.contains(point);
+    }
+};
+
+struct cube
+{
+
+};
+
+struct cylinder
+{
+
+};
+
+struct capsule
+{
+
+};
+
+
+}
