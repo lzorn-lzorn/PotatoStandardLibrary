@@ -13,6 +13,7 @@
 #include <iostream>
 #include <sstream>
 #include <random>
+#include <complex>
 #include <string>
 #include <string_view>
 #include <execution>
@@ -2846,6 +2847,141 @@ namespace core::math
     }
 }
 #endif
+
+
+namespace core::math
+{
+struct quaternion
+{
+
+};
+struct rotator
+{
+    float pitch; // 绕 X 轴旋转
+    float yaw;   // 绕 Y 轴旋转
+    float roll;  // 绕 Z 轴旋转
+
+    rotator() noexcept : pitch(0.f), yaw(0.f), roll(0.f) {}
+    rotator(float p, float y, float r) noexcept : pitch(p), yaw(y), roll(r) {}
+
+    static rotator from_euler(float pitch, float yaw, float roll) noexcept
+    {
+        return rotator(pitch, yaw, roll);
+    }
+
+    static rotator from_quat(const quaternion& q) noexcept
+    {
+       
+    }
+
+    static rotator from_axis_angle(vec3f axis, float angle) noexcept
+    {
+       
+    }
+
+    static rotator from_matrix(const mat3f& m) noexcept
+    {
+       
+    }
+
+    static rotator from_matrix(const mat4f& m) noexcept
+    {
+       
+    }
+
+    static rotator from_vectors(vec3f from, vec3f to) noexcept
+    {
+       
+    }
+
+    static rotator from_xy(vec3f x_axis, vec3f y_axis) noexcept
+    {
+       
+    }
+
+    static rotator from_yz(vec3f y_axis, vec3f z_axis) noexcept
+    {
+       
+    }
+
+    static rotator from_xz(vec3f x_axis, vec3f z_axis) noexcept
+    {
+       
+    }
+
+    static rotator from_string(const std::string& str) noexcept
+    {
+       
+    }
+    static rotator step(rotator current, rotator target, float step_size) noexcept
+    {
+       
+    }
+
+    constexpr static rotator zero() noexcept
+    {
+        return rotator(0.f, 0.f, 0.f);
+    }
+
+    rotator& operator+=(const rotator& other) noexcept
+    {
+        
+        return *this;
+    }
+
+    rotator& operator-=(const rotator& other) noexcept
+    {
+        
+        return *this;
+    }
+
+    bool operator<=>(const rotator& other) const noexcept
+    {
+        
+    }
+    bool equals(const rotator& other, float epsilon = tiny) const noexcept
+    {
+        
+    }
+
+    friend uint32_t hash(rotator r) noexcept
+    {
+        
+    }
+    friend rotator operator+(const rotator& lhs, const rotator& rhs) noexcept;
+    friend rotator operator-(const rotator& lhs, const rotator& rhs) noexcept;
+
+    friend rotator operator*(const rotator& r, float scalar);
+    friend rotator operator*(float scalar, const rotator& r);
+
+    rotator normalized() const noexcept;
+    rotator inverse() const noexcept;
+    void normalize() noexcept;
+    bool is_normalized() const noexcept;
+    bool valid() const noexcept;
+
+    vec3f get_forward_vector() const noexcept;
+    vec3f get_right_vector() const noexcept;
+    vec3f get_up_vector() const noexcept;
+
+    rotator delta(rotator other) noexcept;
+
+    quaternion to_quaternion() const noexcept;
+    mat3f to_matrix3f() const noexcept;
+    mat4f to_matrix4f() const noexcept;
+    std::string to_string() const noexcept;
+};
+
+inline rotator clamp(rotator value, rotator min, rotator max) noexcept;
+
+inline bool approx_zero(rotator r, float epsilon = 1e-6f) noexcept;
+
+inline rotator lerp(rotator a, rotator b, float t) noexcept;
+inline rotator slerp(rotator a, rotator b, float t) noexcept;
+inline rotator delta(rotator a, rotator b) noexcept;
+
+
+}
 
 
 
