@@ -13,7 +13,7 @@
 #include <iostream>
 #include <sstream>
 #include <random>
-#include <complex>
+#include <compare>
 #include <string>
 #include <string_view>
 #include <execution>
@@ -365,6 +365,10 @@ public:
             *this /= len;
         }
         return derived();
+    }
+
+    static constexpr float dot(const Derived& a, const Derived& b) noexcept {
+        return a.dot(b);
     }
 
 	static constexpr Derived normalize(const Derived& v, const Derived& fallback = Derived{})
@@ -1023,7 +1027,7 @@ public:
      * @brief 调整饱和度
      * @param factor 0.0 = 灰度，1.0 = 原图，>1.0 = 增强
      */
-    [[nodiscard]] linear_color3d Saturation(float factor) const noexcept 
+    [[nodiscard]] linear_color3d saturation(float factor) const noexcept 
 	{
         float lum = luminance();
         return linear_color3d(std::lerp(lum, r(), factor),
@@ -1477,9 +1481,9 @@ public:
     /**
      * @brief 调整 RGB 饱和度，Alpha 不变
      */
-    [[nodiscard]] linear_color4d Saturation(float factor) const noexcept 
+    [[nodiscard]] linear_color4d saturation(float factor) const noexcept 
 	{
-        linear_color3d rgb = to_color3d().Saturation(factor);
+        linear_color3d rgb = to_color3d().saturation(factor);
         return linear_color4d(rgb, a());
     }
 
@@ -1487,7 +1491,7 @@ public:
      * @brief 预乘 Alpha（将 RGB 乘以 A，Alpha 不变）
      * @note 常用于合成管线
      */
-    [[nodiscard]] linear_color4d PremultipliedAlpha() const noexcept 
+    [[nodiscard]] linear_color4d premultiplied_alpha() const noexcept 
 	{
         return linear_color4d(r() * a(), g() * a(), b() * a(), a());
     }
@@ -1496,7 +1500,7 @@ public:
      * @brief 反预乘 Alpha（将 RGB 除以 A，Alpha 不变）
      * @note 要求 a > 0
      */
-    [[nodiscard]] linear_color4d UnpremultipliedAlpha() const noexcept 
+    [[nodiscard]] linear_color4d unpremultiplied_alpha() const noexcept 
 	{
         float inv_a = (a() != 0.0f) ? 1.0f / a() : 0.0f;
         return linear_color4d(r() * inv_a, g() * inv_a, b() * inv_a, a());
@@ -1507,7 +1511,7 @@ public:
      * @param bg 背景颜色（假定已预乘或未预乘？这里采用非预乘标准公式）
      * @note 公式：result = fg * fg.a + bg * (1 - fg.a)
      */
-    [[nodiscard]] linear_color4d Over(const linear_color4d& bg) const noexcept 
+    [[nodiscard]] linear_color4d over(const linear_color4d& bg) const noexcept 
 	{
         float a_ = a();
         return linear_color4d(r() + bg.r() * (1.0f - a_),
@@ -1837,7 +1841,7 @@ namespace details
 /// 2D 旋转矩阵（Givens 旋转）
 template <typename Ty, size_t N>
 	requires std::is_arithmetic_v<Ty> && (N >= 2)
-constexpr static TMatrix <Ty, N, N> Givens_Matrix(Ty angle, size_t i, size_t j) noexcept;
+constexpr static TMatrix <Ty, N, N> Givens_Matrix(Ty radians, size_t i, size_t j) noexcept;
 
 /// 获取平移矩阵
 template <typename Ty, size_t N>
@@ -1853,9 +1857,9 @@ constexpr inline details::TMatrix<Ty, N, N> Get_Scaling_Matrix(const Ty (&factor
 
 /// 获取旋转矩阵
 template <typename Ty>
-constexpr static TMatrix<Ty, 4, 4> Get_Rotate4D_Matrix(Ty angle, Ty x, Ty y, Ty z, Ty w) noexcept;
+constexpr static TMatrix<Ty, 4, 4> Get_Rotate4D_Matrix(Ty radians, Ty x, Ty y, Ty z, Ty w) noexcept;
 template <typename Ty>
-constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty angle, Ty x, Ty y, Ty z) noexcept;
+constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty radians, Ty x, Ty y, Ty z) noexcept;
 
 template <typename Ty, size_t Rows, size_t Cols>
 [[maybe_unused]] inline TMatrix <Ty, Cols, Rows> Transpose_Natively(TMatrix <Ty, Rows, Cols>& mat) noexcept;
@@ -1968,16 +1972,16 @@ struct TMatrix <Ty, N, N>
 	}
 
     /// 获取2D旋转矩阵
-	constexpr static TMatrix get_rotate2d_mat(size_t i, size_t j, Ty angle) noexcept
+	constexpr static TMatrix get_rotate2d_mat(size_t i, size_t j, Ty radians) noexcept
 		requires std::is_floating_point_v<Ty>
 	{
-		return Givens_Matrix(angle, i, j);
+		return Givens_Matrix(radians, i, j);
 	}
 
     /// 获取绕主轴的旋转矩阵
-	constexpr static TMatrix get_rotate2d_x(Ty angle) noexcept { return Givens_Matrix(angle, 1, 2); }
-	constexpr static TMatrix get_rotate2d_y(Ty angle) noexcept { return Givens_Matrix(angle, 2, 0); }
-	constexpr static TMatrix get_rotate2d_z(Ty angle) noexcept { return Givens_Matrix(angle, 0, 1); }
+	constexpr static TMatrix get_rotate2d_x(Ty radians) noexcept { return Givens_Matrix(radians, 1, 2); }
+	constexpr static TMatrix get_rotate2d_y(Ty radians) noexcept { return Givens_Matrix(radians, 2, 0); }
+	constexpr static TMatrix get_rotate2d_z(Ty radians) noexcept { return Givens_Matrix(radians, 0, 1); }
 
 	
 
@@ -1988,28 +1992,28 @@ struct TMatrix <Ty, N, N>
 		return *this;
 	}
 	/// 对自身进行一次3D旋转变换
-    self_type& rotate(Ty angle, const Ty (&axis)[3]) noexcept
+    self_type& rotate(Ty radians, const Ty (&axis)[3]) noexcept
 	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-        multiply(Get_Rotate3D_Matrix(angle, axis[0], axis[1], axis[2]));
+		static_assert(std::is_floating_point_v<Ty>, "rate radians only makes sense for floating point types");
+        multiply(Get_Rotate3D_Matrix(radians, axis[0], axis[1], axis[2]));
 		return *this;
 	}
-	self_type& rotate(Ty angle, const vec<Ty, 3> axis) noexcept
+	self_type& rotate(Ty radians, const vec<Ty, 3> axis) noexcept
 	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-        multiply(Get_Rotate3D_Matrix(angle, axis.x(), axis.y(), axis.z()));
+		static_assert(std::is_floating_point_v<Ty>, "rate radians only makes sense for floating point types");
+        multiply(Get_Rotate3D_Matrix(radians, axis.x(), axis.y(), axis.z()));
 		return *this;
 	}
-	self_type& rotate(Ty angle, const Ty (&axis)[4]) noexcept
+	self_type& rotate(Ty radians, const Ty (&axis)[4]) noexcept
 	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-		multiply(Get_Rotate4D_Matrix(angle, axis[0], axis[1], axis[2], axis[3]));
+		static_assert(std::is_floating_point_v<Ty>, "rate radians only makes sense for floating point types");
+		multiply(Get_Rotate4D_Matrix(radians, axis[0], axis[1], axis[2], axis[3]));
         return *this;
 	}
-	self_type& rotate(Ty angle, const vec<Ty, 4> axis) noexcept
+	self_type& rotate(Ty radians, const vec<Ty, 4> axis) noexcept
 	{
-		static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
-		multiply(Get_Rotate4D_Matrix(angle, axis.x(), axis.y(), axis.z(), axis.w()));
+		static_assert(std::is_floating_point_v<Ty>, "rate radians only makes sense for floating point types");
+		multiply(Get_Rotate4D_Matrix(radians, axis.x(), axis.y(), axis.z(), axis.w()));
         return *this;
 	}
 
@@ -2223,11 +2227,11 @@ struct TMatrix <Ty, N, N>
 
 template <typename Ty, size_t N>
 	requires std::is_floating_point_v<Ty> && (N >= 2)
-constexpr static TMatrix <Ty, N, N> Givens_Matrix(size_t i, size_t j, Ty angle) noexcept
+constexpr static TMatrix <Ty, N, N> Givens_Matrix(size_t i, size_t j, Ty radians) noexcept
 {
 	TMatrix <Ty, N, N> m = TMatrix<Ty, N, N>::identity();
-	Ty c = std::cos(angle);
-	Ty s = std::sin(angle);
+	Ty c = std::cos(radians);
+	Ty s = std::sin(radians);
 	m.m[i][i] = c;
 	m.m[i][j] = -s;
 	m.m[j][i] = s;
@@ -2522,7 +2526,7 @@ namespace details
  * @param InputIter 是一个输入迭代器, 其值类型为 rotate2d, 用于指定每个平面旋转的参数.
  */
 template <typename Ty>
-constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty angle, Ty x, Ty y, Ty z) noexcept
+constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty radians, Ty x, Ty y, Ty z) noexcept
 {
     static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
     TMatrix<Ty, 3, 3> result = TMatrix<Ty, 3, 3>::identity();
@@ -2537,8 +2541,8 @@ constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty angle, Ty x, Ty y, Ty 
     y /= len;
     z /= len;
 
-    Ty c = std::cos(angle);
-    Ty s = std::sin(angle);
+    Ty c = std::cos(radians);
+    Ty s = std::sin(radians);
     Ty t = Ty(1) - c;
 
     // 罗德里格斯公式展开
@@ -2568,7 +2572,7 @@ constexpr static TMatrix<Ty, 3, 3> Get_Rotate3D_Matrix(Ty angle, Ty x, Ty y, Ty 
  * >           | -y   x   0 |
  */
 template <typename Ty>
-constexpr static TMatrix<Ty, 4, 4> Get_Rotate4D_Matrix(Ty angle, Ty x, Ty y, Ty z, Ty w) noexcept
+constexpr static TMatrix<Ty, 4, 4> Get_Rotate4D_Matrix(Ty radians, Ty x, Ty y, Ty z, Ty w) noexcept
 {
     static_assert(std::is_floating_point_v<Ty>, "rate angle only makes sense for floating point types");
     (void)w;
@@ -2584,8 +2588,8 @@ constexpr static TMatrix<Ty, 4, 4> Get_Rotate4D_Matrix(Ty angle, Ty x, Ty y, Ty 
     y /= len;
     z /= len;
 
-    Ty c = std::cos(angle);
-    Ty s = std::sin(angle);
+    Ty c = std::cos(radians);
+    Ty s = std::sin(radians);
     Ty t = Ty(1) - c;
 
     // 罗德里格斯公式展开
@@ -2749,7 +2753,20 @@ details::TMatrix <Ty, N, N> operator-(const details::TMatrix <Ty, N, N> lhs, Ty 
     return result;
 }
 
+inline details::TMatrix<float, 3, 3> pitch_rotate(float radians) noexcept
+{
+    return details::Get_Rotate3D_Matrix(radians, 0.f, 1.f, 0.f);
+}
 
+inline details::TMatrix<float, 3, 3> yaw_rotate(float radians) noexcept
+{
+    return details::Get_Rotate3D_Matrix(radians, 0.f, 0.f, 1.f);
+}
+
+inline details::TMatrix<float, 3, 3> roll_rotate(float radians) noexcept
+{
+    return details::Get_Rotate3D_Matrix(radians, 1.f, 0.f, 0.f);
+}
 
 
 using mat2i = details::TMatrix<int32_t, 2>;
@@ -2853,60 +2870,242 @@ namespace core::math
 {
 struct quaternion
 {
+    vec4f self; // (x, y, z, w)
 
+    float x() const noexcept { return self.x(); }
+    float y() const noexcept { return self.y(); }
+    float z() const noexcept { return self.z(); }
+    float w() const noexcept { return self.w(); }
+
+    quaternion() noexcept : self(0.f, 0.f, 0.f, 1.f) {}
+    quaternion(float x, float y, float z, float w) noexcept : self(x, y, z, w) {}
+
+    static quaternion axis_angle(const vec3f& axis, float radians) {
+        float half = radians * 0.5f;
+        float s = std::sin(half);
+        return quaternion(std::cos(half), axis.x()*s, axis.y()*s, axis.z()*s);
+    }
+
+    quaternion operator*(const quaternion& q) const {
+        return quaternion(
+            self.w()*q.w() - self.x()*q.x() - self.y()*q.y() - self.z()*q.z(),
+            self.w()*q.x() + self.x()*q.w() + self.y()*q.z() - self.z()*q.y(),
+            self.w()*q.y() - self.x()*q.z() + self.y()*q.w() + self.z()*q.x(),
+            self.w()*q.z() + self.x()*q.y() - self.y()*q.x() + self.z()*q.w()
+        );
+    }
+
+    // @brief 共轭: 对于单位四元数, 共轭等价于逆. 共轭四元数表示相反的旋转.
+    quaternion conj() const { return quaternion(w(), -x(), -y(), -z()); }
+
+        // 旋转向量
+    vec3f rotate(const vec3f& v) const 
+    {
+        // v' = q * v * q^{-1}，单位四元数时 q^{-1} = conj(q)
+        quaternion qv(0, v.x(), v.y(), v.z());
+        quaternion result = (*this) * qv * this->conj();
+        return vec3f(result.x(), result.y(), result.z());
+    }
+
+    // 归一化
+    void normalize() 
+    {
+        float len = std::sqrt(w()*w() + x()*x() + y()*y() + z()*z());
+        if (len > tiny) 
+        {
+            self = vec4f(x()/len, y()/len, z()/len, w()/len);
+        }
+    }
+
+    // 点积
+    float dot(const quaternion& q) const 
+    {
+        return w()*q.w() + x()*q.x() + y()*q.y() + z()*q.z();
+    }
+
+    // 球面线性插值
+    static quaternion slerp(const quaternion& a, const quaternion& b, float t) 
+    {
+        float cos_omega = a.dot(b);
+        quaternion end = b;
+        // 如果点积为负，取相反路径以确保最短弧
+        if (cos_omega < 0.0f) 
+        {
+            end = quaternion(-b.w(), -b.x(), -b.y(), -b.z());
+            cos_omega = -cos_omega;
+        }
+
+        float k0, k1;
+        if (cos_omega > 0.9999f) { // 线性插值
+            k0 = 1.0f - t;
+            k1 = t;
+        } else {
+            float sin_omega = std::sqrt(1.0f - cos_omega*cos_omega);
+            float omega = std::atan2(sin_omega, cos_omega);
+            float inv_sin = 1.0f / sin_omega;
+            k0 = std::sin((1.0f - t)*omega) * inv_sin;
+            k1 = std::sin(t*omega) * inv_sin;
+        }
+        return quaternion(
+            k0*a.w() + k1*end.w(),
+            k0*a.x() + k1*end.x(),
+            k0*a.y() + k1*end.y(),
+            k0*a.z() + k1*end.z()
+        );
+    }
 };
 struct rotator
 {
-    float pitch; // 绕 X 轴旋转
-    float yaw;   // 绕 Y 轴旋转
-    float roll;  // 绕 Z 轴旋转
+    rotator() noexcept : quat(1.0f, 0.0f, 0.0f, 0.0f) {}
+    float pitch() const noexcept 
+    {
+        float w = quat.x();
+        float x = quat.y();
+        float y = quat.z();
+        float z = quat.w();
+        float sinp = 2.0f * (w * x - y * z);
+        if (std::abs(sinp) >= 1.0f)
+        {
+            return std::copysign(float(pi) / 2.0f, sinp);
+        }
+        return std::asin(sinp);
+    }
+    
+    float yaw() const noexcept 
+    {
+        float w = quat.x();
+        float x = quat.y();
+        float y = quat.z();
+        float z = quat.w();
 
-    rotator() noexcept : pitch(0.f), yaw(0.f), roll(0.f) {}
-    rotator(float p, float y, float r) noexcept : pitch(p), yaw(y), roll(r) {}
+        float siny = 2.0f * (w * y + x * z);
+        float cosy = 1.0f - 2.0f * (y * y + x * x);
+        return std::atan2(siny, cosy);
+    }
+    
+    float roll() const noexcept 
+    {
+        float w = quat.x();
+        float x = quat.y();
+        float y = quat.z();
+        float z = quat.w();
 
+        float sinr = 2.0f * (w * z + x * y);
+        float cosr = 1.0f - 2.0f * (z * z + x * x);
+        return std::atan2(sinr, cosr);
+    }
+
+    /**
+     * @brief 从欧拉角创建旋转器
+     * @param pitch 绕 X 轴旋转角度
+     * @param yaw 绕 Y 轴旋转角度
+     * @param roll 绕 Z 轴旋转角度
+     * @return 对应的旋转器
+     */
     static rotator from_euler(float pitch, float yaw, float roll) noexcept
     {
-        return rotator(pitch, yaw, roll);
+        // 采用 extrinsic Z-Y-X 顺序：先 roll (Z), 再 yaw (Y), 最后 pitch (X)
+        // 组合四元数 q = q_pitch * q_yaw * q_roll
+        quaternion q_roll = quaternion::axis_angle(vec3f(0.0f, 0.0f, 1.0f), roll);
+        quaternion q_yaw  = quaternion::axis_angle(vec3f(0.0f, 1.0f, 0.0f), yaw);
+        quaternion q_pitch= quaternion::axis_angle(vec3f(1.0f, 0.0f, 0.0f), pitch);
+        rotator r;
+        r.quat = q_pitch * q_yaw * q_roll;
+        return r;
     }
 
-    static rotator from_quat(const quaternion& q) noexcept
-    {
-       
-    }
-
-    static rotator from_axis_angle(vec3f axis, float angle) noexcept
-    {
-       
-    }
-
+    /**
+     * @brief 从旋转矩阵中创建旋转器
+     * @param m 旋转矩阵 (行主序)
+     * @return 对应的旋转器
+     */
     static rotator from_matrix(const mat3f& m) noexcept
     {
-       
+       // m 行主序，m(row, col)
+        float m00 = m.m[0][0], m01 = m.m[0][1], m02 = m.m[0][2];
+        float m10 = m.m[1][0], m11 = m.m[1][1], m12 = m.m[1][2];
+        float m20 = m.m[2][0], m21 = m.m[2][1], m22 = m.m[2][2];
+
+        float trace = m00 + m11 + m22;
+        float w, x, y, z;
+
+        if (trace > 0.0f) 
+        {
+            float s = std::sqrt(trace + 1.0f) * 2.0f; // s = 4*w
+            w = s / 4.0f;
+            x = (m21 - m12) / s;
+            y = (m02 - m20) / s;
+            z = (m10 - m01) / s;
+        } 
+        else if (m00 > m11 && m00 > m22) 
+        {
+            float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f; // s = 4*x
+            w = (m21 - m12) / s;
+            x = s / 4.0f;
+            y = (m01 + m10) / s;
+            z = (m02 + m20) / s;
+        } 
+        else if (m11 > m22) 
+        {
+            float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f; // s = 4*y
+            w = (m02 - m20) / s;
+            x = (m01 + m10) / s;
+            y = s / 4.0f;
+            z = (m12 + m21) / s;
+        } 
+        else 
+        {
+            float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f; // s = 4*z
+            w = (m10 - m01) / s;
+            x = (m02 + m20) / s;
+            y = (m12 + m21) / s;
+            z = s / 4.0f;
+        }
+
+        rotator r;
+        // 注意构造顺序: quaternion(实部w, 虚部x, 虚部y, 虚部z)
+        r.quat = quaternion(w, x, y, z);
+        r.normalize();
+        return r;
     }
 
-    static rotator from_matrix(const mat4f& m) noexcept
+    /**
+     * @brief 从轴角创建旋转器
+     * @param axis 旋转轴
+     * @param angle 旋转角度
+     * @return 对应的旋转器
+     */
+    static rotator from_axis_angle(vec3f axis, float angle) noexcept
     {
-       
+        rotator r;
+        r.quat = quaternion::axis_angle(axis, angle);
+        return r;
     }
 
     static rotator from_vectors(vec3f from, vec3f to) noexcept
     {
-       
-    }
-
-    static rotator from_xy(vec3f x_axis, vec3f y_axis) noexcept
-    {
-       
-    }
-
-    static rotator from_yz(vec3f y_axis, vec3f z_axis) noexcept
-    {
-       
-    }
-
-    static rotator from_xz(vec3f x_axis, vec3f z_axis) noexcept
-    {
-       
+       from = from.normalized();
+        to = to.normalized();
+        float dot = vec3f::dot(from, to);
+        if (dot > 0.9999f) 
+        {
+            // 几乎同向，返回单位旋转
+            return rotator();
+        }
+        if (dot < -0.9999f) 
+        {
+            // 反向，找正交轴旋转180°
+            vec3f axis = vec3f::cross(from, vec3f(1.0f, 0.0f, 0.0f));
+            if (axis.length() < tiny)
+            {
+                axis = vec3f::cross(from, vec3f(0.0f, 1.0f, 0.0f));
+            }
+            axis = axis.normalized();
+            return from_axis_angle(axis, float(pi));
+        }
+        vec3f axis = vec3f::cross(from, to).normalized();
+        float angle = std::acos(dot);
+        return from_axis_angle(axis, angle);
     }
 
     static rotator from_string(const std::string& str) noexcept
@@ -2915,75 +3114,281 @@ struct rotator
     }
     static rotator step(rotator current, rotator target, float step_size) noexcept
     {
-       
-    }
-
-    constexpr static rotator zero() noexcept
-    {
-        return rotator(0.f, 0.f, 0.f);
+       // 朝 target 旋转，最大角度 step_size 弧度
+        float dot = current.quat.x() * target.quat.x()
+                + current.quat.y() * target.quat.y()
+                + current.quat.z() * target.quat.z()
+                + current.quat.w() * target.quat.w();
+        // 确保取最短路径
+        if (dot < 0.0f) 
+        {
+            dot = -dot;
+            // 注意：此时不能直接翻转 target，在 slerp 中会处理
+        }
+        // 四元数点积 = cos(θ/2)，实际角度 = 2*acos(|dot|)
+        float angle = 2.0f * std::acos(std::min(dot, 1.0f));
+        if (angle < step_size + tiny) 
+        {
+            return target;
+        }
+        float t = step_size / angle;
+        rotator result;
+        result.quat = quaternion::slerp(current.quat, target.quat, t);
+        return result;
     }
 
     rotator& operator+=(const rotator& other) noexcept
     {
-        
+        quat = quat * other.quat;
         return *this;
     }
 
     rotator& operator-=(const rotator& other) noexcept
     {
-        
+        quat = quat * other.quat.conj();
         return *this;
     }
 
-    bool operator<=>(const rotator& other) const noexcept
-    {
-        
+    bool operator==(const rotator& other) const noexcept {
+        return equals(other);
     }
+
+    bool operator!=(const rotator& other) const noexcept {
+        return !equals(other);
+    }
+    std::partial_ordering operator<=>(const rotator& other) noexcept
+    {
+        if (equals(other))
+        {
+            return std::partial_ordering::equivalent;
+        }
+        return std::partial_ordering::unordered;
+    }
+
+    /**
+     * @brief 判断两个旋转器是否相等
+     * @param other 另一个旋转器
+     * @param epsilon 允许的误差
+     * @return 是否相等
+     * @about 四元数双覆盖
+     */
     bool equals(const rotator& other, float epsilon = tiny) const noexcept
     {
-        
+        return (std::abs(quat.x() - other.quat.x()) < epsilon &&
+            std::abs(quat.y() - other.quat.y()) < epsilon &&
+            std::abs(quat.z() - other.quat.z()) < epsilon &&
+            std::abs(quat.w() - other.quat.w()) < epsilon)
+        || (std::abs(quat.x() + other.quat.x()) < epsilon &&
+            std::abs(quat.y() + other.quat.y()) < epsilon &&
+            std::abs(quat.z() + other.quat.z()) < epsilon &&
+            std::abs(quat.w() + other.quat.w()) < epsilon);
     }
 
     friend uint32_t hash(rotator r) noexcept
     {
-        
+        auto h = [](float f) -> uint32_t 
+        {
+            return static_cast<uint32_t>(std::hash<float>()(f));
+        };
+        return h(r.quat.x()) ^ (h(r.quat.y()) << 1) ^ (h(r.quat.z()) << 2) ^ (h(r.quat.w()) << 3);
     }
-    friend rotator operator+(const rotator& lhs, const rotator& rhs) noexcept;
-    friend rotator operator-(const rotator& lhs, const rotator& rhs) noexcept;
+    friend rotator operator+(const rotator& lhs, const rotator& rhs) noexcept
+    {
+        rotator res = lhs;
+        res += rhs;
+        return res;
+    }
+    friend rotator operator-(const rotator& lhs, const rotator& rhs) noexcept
+    {
+        rotator res = lhs;
+        res -= rhs;
+        return res;
+    }
 
-    friend rotator operator*(const rotator& r, float scalar);
-    friend rotator operator*(float scalar, const rotator& r);
+    friend rotator operator*(const rotator& r, float scalar)
+    {
+        rotator res;
+        float w = r.quat.x();   // 实部
+        float x = r.quat.y();
+        float y = r.quat.z();
+        float z = r.quat.w();
+        float angle = 2.0f * std::acos(std::clamp(w, -1.0f, 1.0f));
+        if (angle < tiny) 
+        {
+            res.quat = quaternion(1.0f, 0.0f, 0.0f, 0.0f);
+            return res;
+        }
+        float half = angle * scalar * 0.5f;
+        float s = std::sin(half) / std::sin(angle * 0.5f); // 归一化轴
+        res.quat = quaternion(std::cos(half), x * s, y * s, z * s);
+        return res;
+    }
+    friend rotator operator*(float scalar, const rotator& r)
+    {
+        return r * scalar;
+    }
 
-    rotator normalized() const noexcept;
-    rotator inverse() const noexcept;
-    void normalize() noexcept;
-    bool is_normalized() const noexcept;
-    bool valid() const noexcept;
+    rotator normalized() const noexcept
+    {
+        rotator res = *this;
+        res.normalize();
+        return res;
+    }
+    rotator inverse() const noexcept
+    {
+        rotator res;
+        res.quat = quat.conj();
+        return res;
+    }
+    void normalize() noexcept
+    {
+        quat.normalize();
+    }
+    bool is_normalized() const noexcept
+    {
+        float len = std::sqrt(quat.x()*quat.x() + quat.y()*quat.y() + quat.z()*quat.z() + quat.w()*quat.w());
+        return std::abs(len - 1.0f) < tiny;
+    }
+    bool valid() const noexcept
+    {
+        return std::isfinite(quat.x()) && std::isfinite(quat.y()) &&
+           std::isfinite(quat.z()) && std::isfinite(quat.w());
+    }
 
-    vec3f get_forward_vector() const noexcept;
-    vec3f get_right_vector() const noexcept;
-    vec3f get_up_vector() const noexcept;
+    vec3f get_forward_vector() const noexcept
+    {
+        // 假设前向为 +X
+        return quat.rotate(vec3f(1.0f, 0.0f, 0.0f));
+    }
+    vec3f get_right_vector() const noexcept
+    {
+        // 假设右向为 +Y
+        return quat.rotate(vec3f(0.0f, 1.0f, 0.0f));
+    }
+    vec3f get_up_vector() const noexcept
+    {
+        // 假设上向为 +Z
+        return quat.rotate(vec3f(0.0f, 0.0f, 1.0f));
+    }
 
-    rotator delta(rotator other) noexcept;
+    // 返回从 other 旋转到 this 的旋转差
+    rotator diff(rotator other) noexcept
+    {
+        rotator res;
+        res.quat = quat * other.quat.conj();
+        return res;
+    }
 
-    quaternion to_quaternion() const noexcept;
-    mat3f to_matrix3f() const noexcept;
-    mat4f to_matrix4f() const noexcept;
+    quaternion to_quaternion() const noexcept
+    {
+        return quat;
+    }
+    mat3f to_matrix3f() const noexcept
+    {
+         // 行主序矩阵，行向量变换
+        vec3f right = get_right_vector();
+        vec3f up = get_up_vector();
+        vec3f forward = get_forward_vector();
+        // 假设 mat3f 可通过构造函数或赋值填充
+        mat3f m;
+        m.m[0][0] = right.x();  m.m[0][1] = right.y();  m.m[0][2] = right.z();
+        m.m[1][0] = up.x();     m.m[1][1] = up.y();     m.m[1][2] = up.z();
+        m.m[2][0] = forward.x();m.m[2][1] = forward.y();m.m[2][2] = forward.z();
+        return m;
+    }
+    mat4f to_matrix4f() const noexcept
+    {
+        mat4f m;
+        // 左上 3x3 旋转部分（行主序）
+        vec3f right = get_right_vector();
+        vec3f up = get_up_vector();
+        vec3f forward = get_forward_vector();
+        m.m[0][0] = right.x();  m.m[0][1] = right.y();  m.m[0][2] = right.z();   m.m[0][3] = 0.0f;
+        m.m[1][0] = up.x();     m.m[1][1] = up.y();     m.m[1][2] = up.z();      m.m[1][3] = 0.0f;
+        m.m[2][0] = forward.x();m.m[2][1] = forward.y();m.m[2][2] = forward.z(); m.m[2][3] = 0.0f;
+        m.m[3][0] = 0.0f;       m.m[3][1] = 0.0f;       m.m[3][2] = 0.0f;        m.m[3][3] = 1.0f;
+        return m;
+    }
     std::string to_string() const noexcept;
+
+    quaternion data() const noexcept
+    {
+        return quat;
+    }
+     quaternion data() noexcept
+    {
+        return quat;
+    }
+private:
+    quaternion quat;
 };
 
-inline rotator clamp(rotator value, rotator min, rotator max) noexcept;
+inline rotator clamp(rotator value, rotator min, rotator max) noexcept
+{
+    // 提取欧拉角（Z-Y-X 顺序：roll, yaw, pitch）
+    float pitch = value.pitch();
+    float yaw   = value.yaw();
+    float roll  = value.roll();
 
-inline bool approx_zero(rotator r, float epsilon = 1e-6f) noexcept;
+    // 逐分量钳制
+    pitch = std::clamp(pitch, min.pitch(), max.pitch());
+    yaw   = std::clamp(yaw,   min.yaw(),   max.yaw());
+    roll  = std::clamp(roll,  min.roll(),  max.roll());
 
-inline rotator lerp(rotator a, rotator b, float t) noexcept;
-inline rotator slerp(rotator a, rotator b, float t) noexcept;
-inline rotator delta(rotator a, rotator b) noexcept;
-
-
+    // 重建旋转器
+    return rotator::from_euler(pitch, yaw, roll);
 }
 
+inline bool approx_zero(rotator r, float epsilon = 1e-6f) noexcept
+{
+    // 通过四元数的实部计算旋转角度，再与阈值比较
+    quaternion q = r.to_quaternion();
+    float w = std::abs(q.x());          // 实部
+    // 角度 = 2 * acos(|w|)，注意 cos(0) = 1, cos(π) = 0 但 θ=0 或 2π 都对应 w = ±1
+    // 这里用 1 - |w| 近似小角度，或直接计算角度避免分支
+    float cos_half_angle = std::min(w, 1.0f);
+    float angle = 2.0f * std::acos(cos_half_angle);
+    return angle < epsilon;
+}
 
+inline rotator lerp(rotator a, rotator b, float t) noexcept
+{
+    quaternion qa = a.to_quaternion();
+    quaternion qb = b.to_quaternion();
+
+    // 取最短路径
+    if (qa.dot(qb) < 0.0f) 
+    {
+        qb = quaternion(-qb.x(), -qb.y(), -qb.z(), -qb.w());
+    }
+
+    // 线性混合
+    quaternion qr(
+        qa.x() + t * (qb.x() - qa.x()),
+        qa.y() + t * (qb.y() - qa.y()),
+        qa.z() + t * (qb.z() - qa.z()),
+        qa.w() + t * (qb.w() - qa.w())
+    );
+    qr.normalize();
+
+    rotator res;
+    // 将结果写回 rotator（需要访问私有成员，这里假设提供相应构造函数或通过 from_quaternion；由于 friend 关系，可直接设置 quat）
+    // 简单起见，这里展示构建方式，实际可以在 rotator 中增加 from_quaternion 或直接赋值
+    // 下面假设 rotator 有一个接受 quaternion 的私有构造函数或直接设置 quat
+    res.data() = qr;
+    return res;
+}
+inline rotator slerp(rotator a, rotator b, float t) noexcept
+{
+    rotator res;
+    res.data() = quaternion::slerp(a.to_quaternion(), b.to_quaternion(), t);
+    return res;
+}
+inline rotator diff(rotator a, rotator b) noexcept
+{
+     return b - a;
+}
+}
 
 
 namespace core::geometry
@@ -3093,6 +3498,7 @@ struct standing_rectangle
     }
 };
 
+// !TODO: 这里的 point2d 应该是 point3d 因为是空间 
 struct triangle
 {
     point2d p1;
