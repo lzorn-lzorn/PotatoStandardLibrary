@@ -9,6 +9,9 @@
 #include <optional>
 #include <memory>
 #include <stdexcept>
+#include <array>
+// #include <thread>
+// #include <iostream>
 
 #include "common.h"
 
@@ -218,9 +221,159 @@ class ring_buffer<T, Allocator, ring_buffer_policy::MPMC>
 {};
 
 // SPSC
-template <typename T, typename Allocator = std::allocator<T>>
+template<typename T>
+concept TriviallyCopyableType = std::is_trivially_copyable_v<T>;
+
+template <TriviallyCopyableType Ty, size_t Capacity>
 class double_buffer
 {
+public:
+    double_buffer() = default;
+    double_buffer(const double_buffer&) = delete;
+    double_buffer& operator=(const double_buffer&) = delete;
+    double_buffer(double_buffer&& other) noexcept
+    {
+        m_write_buffer = std::move(m_write_buffer);
+        m_read_buffer = std::move(m_read_buffer);
+        m_swap_pending.store(other.m_swap_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    
+    double_buffer& operator=(double_buffer&& other) noexcept
+    {
+        if (this != &other)
+        {
+            m_write_buffer = std::move(m_write_buffer);
+            m_read_buffer = std::move(m_read_buffer);
+            m_swap_pending.store(other.m_swap_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
+    ~double_buffer() = default;
 
+    std::span<Ty, Capacity> get_write_buffer()
+    {
+        return std::span { m_write_buffer };
+    }
+
+    [[nodiscard]] bool is_full() const noexcept
+    {
+        // relaxed：仅判断标记，无数据依赖
+        return m_swap_pending.load(std::memory_order_relaxed);
+    }
+
+    // 生产者填充缓冲区, 提交交换请求
+    bool commit() noexcept
+    {
+        if (is_full()) [[unlikely]]
+        {
+            return false;
+        }
+        const uint64_t new_id = m_frame_id.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        m_swap_pending.store(true, std::memory_order_release);
+        m_last_write_frame_id = new_id;
+        return true;
+    }
+    
+    // 检查是否有未交换的待提交数据 (生产者自用)
+    bool has_pending_swap() const noexcept
+    {
+        return m_swap_pending.load(std::memory_order_relaxed);
+    }
+
+    uint64_t current_write_frame_id() const noexcept
+    {
+        return m_last_write_frame_id;
+    }
+
+    void clear_write_buffer() noexcept
+    {
+        std::memset(m_write_buffer.data(), 0, sizeof(m_write_buffer));
+    }
+    // ============== Consumer 消费者接口 =============================
+    bool try_swap() noexcept
+    {
+        if (!m_swap_pending.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+        
+        std::swap(m_read_buffer, m_write_buffer);
+        m_last_read_frame_id = m_last_write_frame_id;
+        m_swap_pending.store(false, std::memory_order_relaxed);
+        return true;
+    }
+    
+    std::span<const Ty, Capacity> get_read_buffer() const noexcept
+    {
+        return std::span { m_read_buffer };
+    }
+
+    uint64_t current_read_frame_id() const noexcept
+    {
+        return m_last_read_frame_id;
+    }
+
+
+    bool has_new_frame() const noexcept
+    {
+        const uint64_t latest = m_frame_id.load(std::memory_order_relaxed);
+        return latest > m_last_read_frame_id;
+    }
+
+    void clear_read_buffer() noexcept
+    {
+        std::memset(m_read_buffer.data(), 0, sizeof(m_read_buffer));
+    }
+
+private:
+    std::array<Ty, Capacity> m_write_buffer{}, m_read_buffer{};
+
+    alignas(std::hardware_destructive_interference_size) std::atomic<bool> m_swap_pending { false };
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> m_frame_id {};
+
+    uint64_t m_last_write_frame_id {0}, m_last_read_frame_id {0};
 };
+/*
+void produce(double_buffer<float, 64>& buffer)
+{
+    float val = 0.0;
+    for (size_t frame = 0; frame < 100; ++frame)
+    {
+        auto write_buffer = buffer.get_write_buffer();
+        for (size_t index = 0; index < 64; ++index)
+        {
+            write_buffer[index] = val++;
+        }
+        buffer.commit();
+        std::cout << "[Producer] 提交第 " << frame << " 帧\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+void consume(double_buffer<float, 64>& buffer)
+{
+    size_t read_frames = 0;
+    while (read_frames < 100)
+    {
+        if (buffer.try_swap())
+        {
+            auto read_span = buffer.get_read_buffer();
+            float first = read_span[0];
+            float last = read_span.back();
+            std::cout << "[Consumer] 读取新帧, 首值=" << first << " 末值=" << last << "\n";
+            read_frames++;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+int main()
+{
+    double_buffer<float, 64> double_buffer_;
+    std::jthread prod (produce, std::ref(double_buffer_));
+    std::jthread cons (consume, std::ref(double_buffer_));
+    return 0;
+}
+*/
 }
