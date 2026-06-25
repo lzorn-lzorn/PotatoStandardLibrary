@@ -17,6 +17,11 @@
 
 namespace core
 {
+constexpr inline bool is_power_of_2(size_t n)
+{
+	return n != 0 && (n & (n - 1)) == 0;
+}
+
 enum class ring_buffer_policy
 {
 	SingleThread,
@@ -32,11 +37,6 @@ class ring_buffer;
 template <typename T, typename Allocator>
 class ring_buffer<T, Allocator, ring_buffer_policy::SingleThread>
 {
-	static constexpr bool is_power_of_2(size_t n)
-	{
-        return n != 0 && (n & (n - 1)) == 0;
-    }
-
 public:
 	using value_type = T;
 	using allocator_type = Allocator;
@@ -143,8 +143,22 @@ public:
 		, m_Tail(other.m_Tail)
 		, m_Mask(other.m_Mask)
 		, m_Buffer(other.m_Buffer)
-		, m_Allocator(std::move(other.m_Allocator))
     {
+		// 根据标准，移动构造应使用 allocator_traits::select_on_container_copy_construction，
+		// 但这里没有源分配器可传播，我们采用以下策略：
+		if constexpr (std::allocator_traits<Allocator>::propagate_on_container_move_assignment::value) 
+		{
+			m_Allocator = std::move(other.m_Allocator);
+		} 
+		else 
+		{
+			// 不传播分配器，要求分配器必须相等，否则无法安全移动
+			if (other.m_Allocator != Allocator{})
+			{
+				throw std::logic_error("Cannot move-construct ring_buffer with non-equal, non-propagating allocators");
+			}
+			// m_Allocator 保持默认构造状态（与 other 的分配器相等）
+		}
         other.m_Capacity = 0;
         other.m_Buffer = nullptr;
     	other.m_Head = 0;
@@ -152,31 +166,43 @@ public:
     	other.m_Mask = 0;
     }
 
-	ring_buffer& operator=(ring_buffer&& other) noexcept
-    {
-	    if (this != &other)
-	    {
-		    clear();
-	    	allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+	ring_buffer& operator=(ring_buffer&& other) 
+		noexcept (allocator_traits::is_always_equal::value && std::is_nothrow_move_assignable_v<Allocator>)
+	{
+		if (this != &other)
+		{
+			clear();
+			allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
 
-	    	m_Allocator = std::move(other.m_Allocator);
-	    	m_Head = other.m_Head;
-	    	m_Tail = other.m_Tail;
-	    	m_Capacity = other.m_Capacity;
-	    	m_Mask = other.m_Mask;
-	    	m_Buffer = other.m_Buffer;
+			if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
+			{
+				m_Allocator = std::move(other.m_Allocator);
+				m_Head = other.m_Head;
+				m_Tail = other.m_Tail;
+				m_Capacity = other.m_Capacity;
+				m_Mask = other.m_Mask;
+				m_Buffer = other.m_Buffer;
+			} else {
+				if (m_Allocator != other.m_Allocator)
+				{
+					throw std::runtime_error("Cannot move-assign ring_buffer with different allocators");
+				}
+				m_Head = other.m_Head;
+				m_Tail = other.m_Tail;
+				m_Capacity = other.m_Capacity;
+				m_Mask = other.m_Mask;
+				m_Buffer = other.m_Buffer;
+			}
 
-	    	other.m_Head = 0;
-	    	other.m_Tail = 0;
-	    	other.m_Capacity = 0;
-	    	other.m_Mask = 0;
-	    	other.m_Buffer = nullptr;
-	    }
-    	return *this;
-    }
+			other.m_Capacity = 0;
+			other.m_Mask = 0;
+			other.m_Buffer = nullptr;
+			other.m_Head = 0;
+			other.m_Tail = 0;
+		}
+		return *this;
+	}
 
-    // 单线程访问（仅在无并发写入/读取时安全）
-    // 只能在无并发修改时使用（如单线程消费后处理）
     reference front() noexcept { return m_Buffer[m_Head & m_Mask]; }
 	const_reference front() const noexcept { return m_Buffer[m_Head & m_Mask]; }
 	reference back() noexcept { return m_Buffer[(m_Tail - 1) & m_Mask]; }
@@ -222,7 +248,7 @@ public:
 
     void pop_front() noexcept
 	{
-    	if (full())
+    	if (empty())
     	{
     		throw std::out_of_range("ring_buffer: buffer is empty");
     	}
@@ -343,9 +369,278 @@ int test_signal_thread()
 	return 0;
 }
 */
+
 template <typename T, typename Allocator>
 class ring_buffer<T, Allocator, ring_buffer_policy::SPSC> 
-{};
+{
+public:
+	using value_type       = T;
+	using allocator_type   = Allocator;
+	using allocator_traits = std::allocator_traits<Allocator>;
+	using size_type        = std::size_t;
+	using difference_type  = allocator_traits::difference_type;
+	using pointer          = typename allocator_traits::pointer;
+	using const_pointer    = typename allocator_traits::const_pointer;
+	using reference        = value_type&;
+	using const_reference  = const value_type&;
+
+private:
+	template <bool IsConst>
+	class iterator_impl 
+	{
+		static_assert(false, "SPSC ring_buffer does not support iterators");
+	};
+
+public:
+	using iterator               = iterator_impl<false>;
+	using const_iterator         = iterator_impl<true>;
+	using reverse_iterator       = std::reverse_iterator<iterator>;
+	using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
+public:
+	explicit ring_buffer(size_type capacity, const Allocator& alloc = Allocator{})
+		: m_Capacity(capacity), m_Mask(capacity - 1), m_Allocator(alloc)
+	{
+		if (m_Capacity == 0 || !is_power_of_2(m_Capacity))
+		{
+			throw std::invalid_argument("Capacity must be a power of 2 and > 0");
+		}
+
+		m_Buffer = allocator_traits::allocate(m_Allocator, m_Capacity);
+	}
+
+	~ring_buffer()
+	{
+		clear();
+		allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+	}
+
+	ring_buffer(const ring_buffer&) = delete;
+	ring_buffer& operator=(const ring_buffer&) = delete;
+
+	// 移动构造/赋值 noexcept
+	ring_buffer(ring_buffer&& other) noexcept
+		: m_Capacity(other.m_Capacity),
+		  m_Mask(other.m_Mask),
+		  m_Buffer(other.m_Buffer)
+	{
+		if constexpr (std::allocator_traits<Allocator>::propagate_on_container_move_assignment::value) 
+		{
+			m_Allocator = std::move(other.m_Allocator);
+		} 
+		else 
+		{
+			// 不传播分配器，要求分配器必须相等，否则无法安全移动
+			if (other.m_Allocator != Allocator{})
+			{
+				throw std::logic_error("Cannot move-construct ring_buffer with non-equal, non-propagating allocators");
+			}
+			// m_Allocator 保持默认构造状态（与 other 的分配器相等）
+		}
+		m_Head.store(other.m_Head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		m_Tail.store(other.m_Tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+		other.m_Capacity = 0;
+		other.m_Mask = 0;
+		other.m_Buffer = nullptr;
+		other.m_Head.store(0, std::memory_order_relaxed);
+		other.m_Tail.store(0, std::memory_order_relaxed);
+	}
+
+	ring_buffer& operator=(ring_buffer&& other) 
+		noexcept (allocator_traits::is_always_equal::value && std::is_nothrow_move_assignable_v<Allocator>)
+	{
+		if (this != &other)
+		{
+			clear();
+			allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+
+			if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
+			{
+				m_Allocator = std::move(other.m_Allocator);
+				m_Capacity = other.m_Capacity;
+				m_Mask = other.m_Mask;
+				m_Buffer = other.m_Buffer;
+				m_Head.store(other.m_Head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+				m_Tail.store(other.m_Tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			} else {
+				if (m_Allocator != other.m_Allocator)
+				{
+					throw std::runtime_error("Cannot move-assign ring_buffer with different allocators");
+				}
+				m_Capacity = other.m_Capacity;
+				m_Mask = other.m_Mask;
+				m_Buffer = other.m_Buffer;
+				m_Head.store(other.m_Head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+				m_Tail.store(other.m_Tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			}
+
+			other.m_Capacity = 0;
+			other.m_Mask = 0;
+			other.m_Buffer = nullptr;
+			other.m_Head.store(0, std::memory_order_relaxed);
+			other.m_Tail.store(0, std::memory_order_relaxed);
+		}
+		return *this;
+	}
+
+	bool try_push(const value_type& value)
+		noexcept(std::is_nothrow_copy_constructible_v<value_type>)
+	{
+		const size_type head = m_Head.load(std::memory_order_acquire);
+		const size_type tail = m_Tail.load(std::memory_order_relaxed);
+
+		if ((tail - head) >= m_Capacity)
+		{
+			return false;
+		}
+
+		const size_type idx = tail & m_Mask;
+		allocator_traits::construct(m_Allocator, std::addressof(m_Buffer[idx]), value);
+		m_Tail.store(tail + 1, std::memory_order_release);
+		return true;
+	}
+
+	bool try_push(value_type&& value)
+		noexcept(std::is_nothrow_move_constructible_v<value_type>)
+	{
+		const size_type head = m_Head.load(std::memory_order_acquire);
+		const size_type tail = m_Tail.load(std::memory_order_relaxed);
+
+		if ((tail - head) >= m_Capacity)
+		{
+			return false;
+		}
+
+		const size_type idx = tail & m_Mask;
+		allocator_traits::construct(m_Allocator, std::addressof(m_Buffer[idx]), std::move(value));
+		m_Tail.store(tail + 1, std::memory_order_release);
+		return true;
+	}
+
+	template <typename... Args>
+	bool try_emplace(Args&&... args)
+		noexcept(std::is_nothrow_constructible_v<T, Args&&...>)
+	{
+		const size_type head = m_Head.load(std::memory_order_acquire);
+		const size_type tail = m_Tail.load(std::memory_order_relaxed);
+
+		if ((tail - head) >= m_Capacity)
+		{
+			return false;
+		}
+
+		const size_type idx = tail & m_Mask;
+		allocator_traits::construct(m_Allocator, std::addressof(m_Buffer[idx]), std::forward<Args>(args)...);
+		m_Tail.store(tail + 1, std::memory_order_release);
+		return true;
+	}
+
+	std::optional<T> try_pop() noexcept
+	{
+		const size_type head = m_Head.load(std::memory_order_relaxed);
+		const size_type tail = m_Tail.load(std::memory_order_acquire);
+		if (head == tail)
+		{
+			return std::nullopt;
+		}
+
+		const size_type idx = head & m_Mask;
+		T ret = std::move(m_Buffer[idx]);
+		allocator_traits::destroy(m_Allocator, std::addressof(m_Buffer[idx]));
+		m_Head.store(head + 1, std::memory_order_release);
+		return ret;
+	}
+
+	// ====================== 容量查询(仅快照，值瞬时失效) ======================
+	[[nodiscard]] bool empty() const noexcept
+	{
+		const size_type head = m_Head.load(std::memory_order_relaxed);
+		const size_type tail = m_Tail.load(std::memory_order_relaxed);
+		return head == tail;
+	}
+
+	[[nodiscard]] bool full() const noexcept
+	{
+		const size_type head = m_Head.load(std::memory_order_relaxed);
+		const size_type tail = m_Tail.load(std::memory_order_relaxed);
+		return tail - head == m_Capacity;
+	}
+
+	[[nodiscard]] size_type size() const noexcept
+	{
+		const size_type head = m_Head.load(std::memory_order_relaxed);
+		const size_type tail = m_Tail.load(std::memory_order_relaxed);
+		return tail - head;
+	}
+
+	[[nodiscard]] size_type capacity() const noexcept { return m_Capacity; }
+	[[nodiscard]] size_type max_size() const noexcept { return allocator_traits::max_size(m_Allocator); }
+
+	void clear() noexcept
+	{
+		while (!empty())
+		{
+			[[maybe_unused]] auto val = try_pop();
+		}
+	}
+
+
+	[[nodiscard]] std::pair<std::span<T>, std::span<T>> linearize_views()
+	{
+		static_assert([]{
+			constexpr bool ok = []{
+				// 提示使用者该接口仅静态单线程快照可用
+				return true;
+			}();
+			return ok;
+		}(), "linearize_views() only safe when producer & consumer threads are stopped entirely");
+
+		const size_type h = m_Head.load(std::memory_order_relaxed);
+		const size_type t = m_Tail.load(std::memory_order_relaxed);
+		const size_type sz = t - h;
+		if (sz == 0) return {};
+
+		const size_type h_idx = h & m_Mask;
+		const size_type first_len = std::min(m_Capacity - h_idx, sz);
+		return {
+			std::span<T>(m_Buffer + h_idx, first_len),
+			std::span<T>(m_Buffer, sz - first_len)
+		};
+	}
+
+	[[nodiscard]] std::pair<std::span<const T>, std::span<const T>> linearize_views() const
+	{
+		static_assert([]{
+			constexpr bool ok = []{ return true; }();
+			return ok;
+		}(), "linearize_views() only safe when producer & consumer threads are stopped entirely");
+
+		const size_type h = m_Head.load(std::memory_order_relaxed);
+		const size_type t = m_Tail.load(std::memory_order_relaxed);
+		const size_type sz = t - h;
+		if (sz == 0) return {};
+
+		const size_type h_idx = h & m_Mask;
+		const size_type first_len = std::min(m_Capacity - h_idx, sz);
+		return {
+			std::span<const T>(m_Buffer + h_idx, first_len),
+			std::span<const T>(sz ? (m_Buffer + h_idx) : nullptr, first_len),
+			std::span<const T>(m_Buffer, sz - first_len)
+		};
+	}
+
+	// 分配器访问
+	[[nodiscard]] allocator_type get_allocator() const noexcept { return m_Allocator; }
+private:
+	alignas(CacheLineSize) std::atomic<size_type> m_Head{0};
+	alignas(CacheLineSize) std::atomic<size_type> m_Tail{0};
+
+	size_type m_Capacity;
+	size_type m_Mask;
+	pointer m_Buffer;
+	Allocator m_Allocator;
+};
 
 template <typename T, typename Allocator>
 class ring_buffer<T, Allocator, ring_buffer_policy::MPSC>
@@ -377,7 +672,7 @@ public:
 
     [[nodiscard]] bool is_committed() const noexcept
     {
-        return m_swap_pending.load(std::memory_order_relaxed);
+        return m_swap_pending.load(std::memory_order_acquire);
     }
 
     // 生产者填充缓冲区, 提交交换请求
@@ -413,7 +708,7 @@ public:
         
         write_idx = 1 - write_idx;
         m_last_read_frame_id = m_last_write_frame_id;
-        m_swap_pending.store(false, std::memory_order_relaxed);
+        m_swap_pending.store(false, std::memory_order_release);
         return true;
     }
     
