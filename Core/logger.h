@@ -1,5 +1,6 @@
 #pragma once 
 
+#include <array>
 #include <chrono>
 #include <source_location>
 #include <string_view>
@@ -15,7 +16,11 @@
 #include "common.h"
 #include "buffer.h"
 
-
+#ifndef NDEBUG // release 模式
+#	define BufferSize 64 * 1024 //64 KB
+#else
+#	define BufferSize 256 * 1024 // 256kb
+#endif
 namespace core::component 
 {
 static inline std::atomic<unsigned long long> report_uid = 1;
@@ -54,17 +59,17 @@ struct default_category : public category<default_category>
 
 class message
 {
-
+public:
 	template <typename CategoryTy = default_category>
 	static message make_message(uint64_t id, level lv, category<CategoryTy> cat, std::source_location called_loc,std::string_view msg) 
 	{
 		return message(id, lv, cat.name(), called_loc, msg);
 	}
 	
-
+	message() = default;
 	~message() = default;
-	message(const message&) = delete;
-	message& operator=(const message&) = delete;
+	message(const message&) = default;
+	message& operator=(const message&) = default;
 	message(message&&) noexcept = default;
 	message& operator=(message&&) noexcept = default;
 	
@@ -93,7 +98,7 @@ private:
 	std::string_view m_category_name {  };
 	uint64_t m_id { 0 };
 	std::source_location m_called_loc { std::source_location::current() };
-	std::string m_message_text;
+	std::string_view m_message_text;
 	std::chrono::steady_clock::time_point m_time;
 };
 
@@ -118,7 +123,7 @@ private:
 
 private:
 	ring_buffer<message, std::allocator<message>, ring_buffer_policy::MPSC> m_message_buffer;
-	double_buffer<message, std::allocator<message>> m_message_double_buffer;
+	double_buffer<message, BufferSize> m_message_double_buffer;
 	dynamic_array<std::string> m_sinks;
 	std::jthread m_worker_thread;
 	std::jthread m_file_writer_thread;

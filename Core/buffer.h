@@ -231,40 +231,24 @@ public:
     double_buffer() = default;
     double_buffer(const double_buffer&) = delete;
     double_buffer& operator=(const double_buffer&) = delete;
-    double_buffer(double_buffer&& other) noexcept
-    {
-        m_write_buffer = std::move(m_write_buffer);
-        m_read_buffer = std::move(m_read_buffer);
-        m_swap_pending.store(other.m_swap_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    }
-    
-    double_buffer& operator=(double_buffer&& other) noexcept
-    {
-        if (this != &other)
-        {
-            m_write_buffer = std::move(m_write_buffer);
-            m_read_buffer = std::move(m_read_buffer);
-            m_swap_pending.store(other.m_swap_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        }
-        return *this;
-    }
+    double_buffer(double_buffer&& other) noexcept = delete;
+    double_buffer& operator=(double_buffer&& other) noexcept = delete;
     ~double_buffer() = default;
 
     std::span<Ty, Capacity> get_write_buffer()
     {
-        return std::span { m_write_buffer };
+        return std::span { m_buffers[write_idx] };
     }
 
-    [[nodiscard]] bool is_full() const noexcept
+    [[nodiscard]] bool is_committed() const noexcept
     {
-        // relaxed：仅判断标记，无数据依赖
         return m_swap_pending.load(std::memory_order_relaxed);
     }
 
     // 生产者填充缓冲区, 提交交换请求
     bool commit() noexcept
     {
-        if (is_full()) [[unlikely]]
+        if (is_committed()) [[unlikely]]
         {
             return false;
         }
@@ -275,12 +259,6 @@ public:
         return true;
     }
     
-    // 检查是否有未交换的待提交数据 (生产者自用)
-    bool has_pending_swap() const noexcept
-    {
-        return m_swap_pending.load(std::memory_order_relaxed);
-    }
-
     uint64_t current_write_frame_id() const noexcept
     {
         return m_last_write_frame_id;
@@ -288,7 +266,7 @@ public:
 
     void clear_write_buffer() noexcept
     {
-        std::memset(m_write_buffer.data(), 0, sizeof(m_write_buffer));
+        std::memset(m_buffers[write_idx].data(), 0, sizeof(m_buffers[write_idx]));
     }
     // ============== Consumer 消费者接口 =============================
     bool try_swap() noexcept
@@ -298,7 +276,7 @@ public:
             return false;
         }
         
-        std::swap(m_read_buffer, m_write_buffer);
+        write_idx = 1 - write_idx;
         m_last_read_frame_id = m_last_write_frame_id;
         m_swap_pending.store(false, std::memory_order_relaxed);
         return true;
@@ -306,7 +284,7 @@ public:
     
     std::span<const Ty, Capacity> get_read_buffer() const noexcept
     {
-        return std::span { m_read_buffer };
+        return std::span { m_buffers[1-write_idx] };
     }
 
     uint64_t current_read_frame_id() const noexcept
@@ -317,20 +295,20 @@ public:
 
     bool has_new_frame() const noexcept
     {
-        const uint64_t latest = m_frame_id.load(std::memory_order_relaxed);
+        const uint64_t latest = m_frame_id.load(std::memory_order_acquire);
         return latest > m_last_read_frame_id;
     }
 
     void clear_read_buffer() noexcept
     {
-        std::memset(m_read_buffer.data(), 0, sizeof(m_read_buffer));
+        std::memset(m_buffers[1-write_idx].data(), 0, sizeof(m_buffers[1-write_idx]));
     }
 
 private:
-    std::array<Ty, Capacity> m_write_buffer{}, m_read_buffer{};
-
-    alignas(std::hardware_destructive_interference_size) std::atomic<bool> m_swap_pending { false };
-    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> m_frame_id {};
+    std::array<Ty, Capacity> m_buffers[2];
+    size_t write_idx = 0;
+    alignas(CacheLineSize) std::atomic<bool> m_swap_pending { false };
+    alignas(CacheLineSize) std::atomic<uint64_t> m_frame_id {};
 
     uint64_t m_last_write_frame_id {0}, m_last_read_frame_id {0};
 };
