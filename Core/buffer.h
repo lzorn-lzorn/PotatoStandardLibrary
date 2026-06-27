@@ -644,7 +644,280 @@ private:
 
 template <typename T, typename Allocator>
 class ring_buffer<T, Allocator, ring_buffer_policy::MPSC>
-{};
+{
+public:
+    using value_type       = T;
+    using allocator_type   = Allocator;
+    using allocator_traits = std::allocator_traits<Allocator>;
+    using size_type        = std::size_t;
+    using difference_type  = allocator_traits::difference_type;
+    using pointer          = typename allocator_traits::pointer;
+    using const_pointer    = typename allocator_traits::const_pointer;
+    using reference        = value_type&;
+    using const_reference  = const value_type&;
+
+private:
+	template <bool IsConst>
+	class iterator_impl 
+	{
+		static_assert(false, "MPSC ring_buffer does not support iterators");
+	};
+
+public:
+	using iterator               = iterator_impl<false>;
+    using const_iterator         = iterator_impl<true>;
+    using reverse_iterator       = std::reverse_iterator<iterator>;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
+	explicit ring_buffer(size_type capacity, const Allocator& alloc = Allocator{})
+        : m_Capacity(capacity)
+        , m_Mask(capacity - 1)
+        , m_Allocator(alloc)
+        , m_Ready(new std::atomic<unsigned char>[capacity]())  // 全零初始化（空闲）
+    {
+        if (m_Capacity == 0 || !is_power_of_2(m_Capacity))
+		{
+			throw std::invalid_argument("Capacity must be a power of 2 and > 0");
+		}
+
+        m_Buffer = allocator_traits::allocate(m_Allocator, m_Capacity);
+    }
+
+	~ring_buffer()
+    {
+        clear();
+        allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+    }
+
+	ring_buffer(const ring_buffer&) = delete;
+    ring_buffer& operator=(const ring_buffer&) = delete;
+
+	ring_buffer(ring_buffer&& other) noexcept
+        : m_Capacity(other.m_Capacity)
+        , m_Mask(other.m_Mask)
+        , m_Buffer(other.m_Buffer)
+        , m_Ready(std::move(other.m_Ready))
+    {
+        if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
+        {
+			m_Allocator = std::move(other.m_Allocator);
+		}
+        else
+        {
+            if (other.m_Allocator != Allocator{})
+            {
+				throw std::logic_error("Cannot move-construct ring_buffer with non-equal, non-propagating allocators");
+			}
+        }
+
+        m_Head.store(other.m_Head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_Tail.store(other.m_Tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+        other.m_Capacity = 0;
+        other.m_Mask = 0;
+        other.m_Buffer = nullptr;
+        other.m_Head.store(0, std::memory_order_relaxed);
+        other.m_Tail.store(0, std::memory_order_relaxed);
+    }
+
+	 ring_buffer& operator=(ring_buffer&& other) 
+        noexcept (allocator_traits::is_always_equal::value && std::is_nothrow_move_assignable_v<Allocator>)
+    {
+        if (this != &other)
+        {
+            clear();
+            allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+
+            if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
+            {
+                m_Allocator = std::move(other.m_Allocator);
+                m_Capacity = other.m_Capacity;
+                m_Mask = other.m_Mask;
+                m_Buffer = other.m_Buffer;
+                m_Ready = std::move(other.m_Ready);
+            }
+            else
+            {
+                if (m_Allocator != other.m_Allocator)
+                    throw std::runtime_error("Cannot move-assign ring_buffer with different allocators");
+                m_Capacity = other.m_Capacity;
+                m_Mask = other.m_Mask;
+                m_Buffer = other.m_Buffer;
+                m_Ready = std::move(other.m_Ready);
+            }
+
+            m_Head.store(other.m_Head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_Tail.store(other.m_Tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+            other.m_Capacity = 0;
+            other.m_Mask = 0;
+            other.m_Buffer = nullptr;
+            other.m_Head.store(0, std::memory_order_relaxed);
+            other.m_Tail.store(0, std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
+	bool try_push(const value_type& value)
+		noexcept(std::is_nothrow_copy_constructible_v<value_type>)
+	{
+		size_type head, tail;
+		do 
+		{
+			head = m_Head.load(std::memory_order_acquire);
+			tail = m_Tail.load(std::memory_order_relaxed);
+			if ((tail - head) >= m_Capacity)
+			{
+				return false;
+			}
+		} while (!m_Tail.compare_exchange_weak(tail, tail + 1, std::memory_order_acq_rel, std::memory_order_relaxed));
+
+		const size_type idx = tail & m_Mask;
+		allocator_traits::construct(m_Allocator, std::addressof(m_Buffer[idx]), value);
+		m_Ready[idx].store(1, std::memory_order_release);
+		return true;
+	}
+
+	bool try_push(value_type&& value)
+        noexcept(std::is_nothrow_move_constructible_v<value_type>)
+    {
+        size_type head, tail;
+        do
+        {
+            head = m_Head.load(std::memory_order_acquire);
+            tail = m_Tail.load(std::memory_order_relaxed);
+            if (tail - head >= m_Capacity)
+                return false;
+        } while (!m_Tail.compare_exchange_weak(tail, tail + 1,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_relaxed));
+
+        const size_type idx = tail & m_Mask;
+        allocator_traits::construct(m_Allocator, std::addressof(m_Buffer[idx]), std::move(value));
+        m_Ready[idx].store(1, std::memory_order_release);
+        return true;
+    }
+
+	template <typename... Args>
+    bool try_emplace(Args&&... args)
+        noexcept(std::is_nothrow_constructible_v<value_type, Args&&...>)
+    {
+        size_type head, tail;
+        do
+        {
+            head = m_Head.load(std::memory_order_acquire);
+            tail = m_Tail.load(std::memory_order_relaxed);
+            if (tail - head >= m_Capacity)
+            {
+				return false;
+			}
+        } while (!m_Tail.compare_exchange_weak(tail, tail + 1,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_relaxed));
+
+        const size_type idx = tail & m_Mask;
+        allocator_traits::construct(m_Allocator, std::addressof(m_Buffer[idx]),
+                                    std::forward<Args>(args)...);
+        m_Ready[idx].store(1, std::memory_order_release);
+        return true;
+    }
+
+	std::optional<value_type> try_pop() noexcept
+    {
+        const size_type head = m_Head.load(std::memory_order_relaxed);
+        const size_type idx = head & m_Mask;
+
+        if (m_Ready[idx].load(std::memory_order_acquire) == 0)
+		{
+			return std::nullopt;
+		}
+
+        value_type ret = std::move(m_Buffer[idx]);
+        allocator_traits::destroy(m_Allocator, std::addressof(m_Buffer[idx]));
+        m_Ready[idx].store(0, std::memory_order_release);
+        m_Head.store(head + 1, std::memory_order_release);
+        return ret;
+    }
+
+	void clear() noexcept
+    {
+        // 前提：调用 clear 前必须保证所有生产者已停止，否则可能漏删正在构造的元素
+        while (auto val = try_pop())
+        {
+            // 弹出并析构所有已发布元素
+        }
+    }
+
+	[[nodiscard]] bool empty() const noexcept
+    {
+        return m_Head.load(std::memory_order_relaxed) == m_Tail.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool full() const noexcept
+    {
+        const size_type head = m_Head.load(std::memory_order_relaxed);
+        const size_type tail = m_Tail.load(std::memory_order_relaxed);
+        return tail - head == m_Capacity;
+    }
+
+    [[nodiscard]] size_type size() const noexcept
+    {
+        const size_type head = m_Head.load(std::memory_order_relaxed);
+        const size_type tail = m_Tail.load(std::memory_order_relaxed);
+        return tail - head;
+    }
+
+    [[nodiscard]] size_type capacity() const noexcept { return m_Capacity; }
+
+	[[nodiscard]] std::pair<std::span<T>, std::span<T>> linearize_views() noexcept
+    {
+        static_assert([]{
+            return true;
+        }(), "linearize_views() only safe when all threads are stopped");
+
+        const size_type h = m_Head.load(std::memory_order_relaxed);
+        const size_type t = m_Tail.load(std::memory_order_relaxed);
+        const size_type sz = t - h;
+        if (sz == 0) return {};
+
+        const size_type h_idx = h & m_Mask;
+        const size_type first_len = std::min(m_Capacity - h_idx, sz);
+        return {
+            std::span<T>(m_Buffer + h_idx, first_len),
+            std::span<T>(m_Buffer, sz - first_len)
+        };
+    }
+
+    [[nodiscard]] std::pair<std::span<const T>, std::span<const T>> linearize_views() const noexcept
+    {
+        static_assert([]{
+            return true;
+        }(), "linearize_views() only safe when all threads are stopped");
+
+        const size_type h = m_Head.load(std::memory_order_relaxed);
+        const size_type t = m_Tail.load(std::memory_order_relaxed);
+        const size_type sz = t - h;
+        if (sz == 0) return {};
+
+        const size_type h_idx = h & m_Mask;
+        const size_type first_len = std::min(m_Capacity - h_idx, sz);
+        return {
+            std::span<const T>(m_Buffer + h_idx, first_len),
+            std::span<const T>(m_Buffer, sz - first_len)
+        };
+    }
+private:
+    alignas(CacheLineSize) std::atomic<size_type> m_Head{0};
+    alignas(CacheLineSize) std::atomic<size_type> m_Tail{0};
+
+    size_type m_Capacity;
+    size_type m_Mask;
+    pointer m_Buffer;
+    Allocator m_Allocator;
+
+    // 每个槽位的就绪标志：0 - 空闲, 1 - 已发布有效元素
+    std::unique_ptr<std::atomic<unsigned char>[]> m_Ready;
+};
 
 template <typename T, typename Allocator>
 class ring_buffer<T, Allocator, ring_buffer_policy::MPMC>
