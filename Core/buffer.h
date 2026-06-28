@@ -921,7 +921,309 @@ private:
 
 template <typename T, typename Allocator>
 class ring_buffer<T, Allocator, ring_buffer_policy::MPMC>
-{};
+{
+public:
+    using value_type       = T;
+    using allocator_type   = Allocator;
+    using allocator_traits = std::allocator_traits<Allocator>;
+    using size_type        = std::size_t;
+    using difference_type  = allocator_traits::difference_type;
+    using pointer          = typename allocator_traits::pointer;
+    using const_pointer    = typename allocator_traits::const_pointer;
+    using reference        = value_type&;
+    using const_reference  = const value_type&;
+
+private:
+    template <bool IsConst>
+    class iterator_impl 
+    {
+        static_assert(false, "MPMC ring_buffer does not support iterators");
+    };
+
+public:
+    using iterator               = iterator_impl<false>;
+    using const_iterator         = iterator_impl<true>;
+    using reverse_iterator       = std::reverse_iterator<iterator>;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
+	explicit ring_buffer(size_type capacity, const Allocator& alloc = Allocator{})
+        : m_Capacity(capacity)
+        , m_Mask(capacity - 1)
+        , m_Allocator(alloc)
+        , m_Sequence(new std::atomic<size_type>[capacity])
+    {
+        if (m_Capacity == 0 || !is_power_of_2(m_Capacity))
+		{
+			throw std::invalid_argument("Capacity must be a power of 2 and > 0");
+		}
+
+
+        m_Buffer = allocator_traits::allocate(m_Allocator, m_Capacity);
+
+        // 序列号初始化为槽位索引：槽位 i 期望的写入序列号就是 i
+        for (size_type i = 0; i < m_Capacity; ++i)
+        {
+			m_Sequence[i].store(i, std::memory_order_relaxed);
+		}
+    }
+
+	~ring_buffer()
+    {
+        clear();
+        allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+    }
+
+    ring_buffer(const ring_buffer&) = delete;
+    ring_buffer& operator=(const ring_buffer&) = delete;
+
+	    ring_buffer(ring_buffer&& other) noexcept
+        : m_Capacity(other.m_Capacity)
+        , m_Mask(other.m_Mask)
+        , m_Buffer(other.m_Buffer)
+        , m_Sequence(std::move(other.m_Sequence))
+    {
+        if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
+            m_Allocator = std::move(other.m_Allocator);
+        else
+        {
+            if (other.m_Allocator != Allocator{})
+                throw std::logic_error("Cannot move-construct ring_buffer with non-equal, non-propagating allocators");
+        }
+
+        m_EnqueuePos.store(other.m_EnqueuePos.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_DequeuePos.store(other.m_DequeuePos.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+        other.m_Capacity = 0;
+        other.m_Mask = 0;
+        other.m_Buffer = nullptr;
+        other.m_EnqueuePos.store(0, std::memory_order_relaxed);
+        other.m_DequeuePos.store(0, std::memory_order_relaxed);
+    }
+
+    // 移动赋值
+    ring_buffer& operator=(ring_buffer&& other) 
+        noexcept (allocator_traits::is_always_equal::value && std::is_nothrow_move_assignable_v<Allocator>)
+    {
+        if (this != &other)
+        {
+            clear();
+            allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+
+            if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
+            {
+                m_Allocator = std::move(other.m_Allocator);
+                m_Capacity = other.m_Capacity;
+                m_Mask = other.m_Mask;
+                m_Buffer = other.m_Buffer;
+                m_Sequence = std::move(other.m_Sequence);
+            }
+            else
+            {
+                if (m_Allocator != other.m_Allocator)
+				{
+					throw std::runtime_error("Cannot move-assign ring_buffer with different allocators");
+				}
+	
+                m_Capacity = other.m_Capacity;
+                m_Mask = other.m_Mask;
+                m_Buffer = other.m_Buffer;
+                m_Sequence = std::move(other.m_Sequence);
+            }
+
+            m_EnqueuePos.store(other.m_EnqueuePos.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_DequeuePos.store(other.m_DequeuePos.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+            other.m_Capacity = 0;
+            other.m_Mask = 0;
+            other.m_Buffer = nullptr;
+            other.m_EnqueuePos.store(0, std::memory_order_relaxed);
+            other.m_DequeuePos.store(0, std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
+	bool try_push(const value_type& value)
+        noexcept(std::is_nothrow_copy_constructible_v<value_type>)
+    {
+        size_type pos = m_EnqueuePos.load(std::memory_order_relaxed);
+        while(true)
+        {
+            const size_type idx = pos & m_Mask;
+            const size_type seq = m_Sequence[idx].load(std::memory_order_acquire);
+
+            if (seq != pos)                     // 槽位不空闲（满）
+            {
+				return false;
+			}
+
+            // 尝试原子申请该写入位置
+            if (m_EnqueuePos.compare_exchange_weak(pos, pos + 1,
+                                                   std::memory_order_relaxed,
+                                                   std::memory_order_relaxed))
+            {
+                // 成功占用槽位 idx
+                allocator_traits::construct(m_Allocator, std::addressof(m_Buffer[idx]), value);
+                m_Sequence[idx].store(pos + 1, std::memory_order_release);
+                return true;
+            }
+            // CAS 失败：pos 自动更新为最新值，重试
+        }
+    }
+
+	bool try_push(value_type&& value)
+        noexcept(std::is_nothrow_move_constructible_v<value_type>)
+    {
+        size_type pos = m_EnqueuePos.load(std::memory_order_relaxed);
+        while(true)
+        {
+            const size_type idx = pos & m_Mask;
+            const size_type seq = m_Sequence[idx].load(std::memory_order_acquire);
+
+            if (seq != pos)
+            {
+				return false;
+			}
+
+            if (m_EnqueuePos.compare_exchange_weak(pos, pos + 1,
+                                                   std::memory_order_relaxed,
+                                                   std::memory_order_relaxed))
+            {
+                allocator_traits::construct(m_Allocator, std::addressof(m_Buffer[idx]), std::move(value));
+                m_Sequence[idx].store(pos + 1, std::memory_order_release);
+                return true;
+            }
+        }
+    }
+
+	template <typename... Args>
+    bool try_emplace(Args&&... args)
+        noexcept(std::is_nothrow_constructible_v<value_type, Args&&...>)
+    {
+        size_type pos = m_EnqueuePos.load(std::memory_order_relaxed);
+        while(true)
+        {
+            const size_type idx = pos & m_Mask;
+            const size_type seq = m_Sequence[idx].load(std::memory_order_acquire);
+
+            if (seq != pos)
+            {
+				return false;
+			}
+
+            if (m_EnqueuePos.compare_exchange_weak(pos, pos + 1,
+                                                   std::memory_order_relaxed,
+                                                   std::memory_order_relaxed))
+            {
+                allocator_traits::construct(m_Allocator, std::addressof(m_Buffer[idx]),
+                                            std::forward<Args>(args)...);
+                m_Sequence[idx].store(pos + 1, std::memory_order_release);
+                return true;
+            }
+        }
+    }
+
+	std::optional<value_type> try_pop() noexcept
+    {
+        size_type pos = m_DequeuePos.load(std::memory_order_relaxed);
+        while(true)
+        {
+            const size_type idx = pos & m_Mask;
+            const size_type seq = m_Sequence[idx].load(std::memory_order_acquire);
+
+            if (seq != pos + 1)                  // 槽位未就绪（空）
+            {
+				return std::nullopt;
+			}
+
+            if (m_DequeuePos.compare_exchange_weak(pos, pos + 1,
+                                                   std::memory_order_relaxed,
+                                                   std::memory_order_relaxed))
+            {
+                // 成功占用消费权
+                value_type ret = std::move(m_Buffer[idx]);
+                allocator_traits::destroy(m_Allocator, std::addressof(m_Buffer[idx]));
+
+                // 释放槽位：下一个写入该槽位的生产者将使用 pos + m_Capacity
+                m_Sequence[idx].store(pos + m_Capacity, std::memory_order_release);
+                return ret;
+            }
+        }
+    }
+
+	[[nodiscard]] bool empty() const noexcept
+    {
+        return m_EnqueuePos.load(std::memory_order_relaxed) ==
+               m_DequeuePos.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool full() const noexcept
+    {
+        const size_type enq = m_EnqueuePos.load(std::memory_order_relaxed);
+        const size_type deq = m_DequeuePos.load(std::memory_order_relaxed);
+        return (enq - deq) >= m_Capacity;
+    }
+
+    [[nodiscard]] size_type size() const noexcept
+    {
+        const size_type enq = m_EnqueuePos.load(std::memory_order_relaxed);
+        const size_type deq = m_DequeuePos.load(std::memory_order_relaxed);
+        return enq - deq;
+    }
+
+    [[nodiscard]] size_type capacity() const noexcept { return m_Capacity; }
+
+	void clear() noexcept
+    {
+        // 要求所有生产者/消费者均停止
+        while (auto val = try_pop()){ }
+        
+    }
+
+	[[nodiscard]] std::pair<std::span<T>, std::span<T>> linearize_views() noexcept
+    {
+        static_assert([]{ return true; }(), "linearize_views() only safe when all threads are stopped");
+
+        const size_type h = m_DequeuePos.load(std::memory_order_relaxed);
+        const size_type t = m_EnqueuePos.load(std::memory_order_relaxed);
+        const size_type sz = t - h;
+        if (sz == 0) return {};
+
+        const size_type h_idx = h & m_Mask;
+        const size_type first_len = std::min(m_Capacity - h_idx, sz);
+        return {
+            std::span<T>(m_Buffer + h_idx, first_len),
+            std::span<T>(m_Buffer, sz - first_len)
+        };
+    }
+
+    [[nodiscard]] std::pair<std::span<const T>, std::span<const T>> linearize_views() const noexcept
+    {
+        static_assert([]{ return true; }(), "linearize_views() only safe when all threads are stopped");
+
+        const size_type h = m_DequeuePos.load(std::memory_order_relaxed);
+        const size_type t = m_EnqueuePos.load(std::memory_order_relaxed);
+        const size_type sz = t - h;
+        if (sz == 0) return {};
+
+        const size_type h_idx = h & m_Mask;
+        const size_type first_len = std::min(m_Capacity - h_idx, sz);
+        return {
+            std::span<const T>(m_Buffer + h_idx, first_len),
+            std::span<const T>(m_Buffer, sz - first_len)
+        };
+    }
+private:
+    alignas(CacheLineSize) std::atomic<size_type> m_EnqueuePos{0};
+    alignas(CacheLineSize) std::atomic<size_type> m_DequeuePos{0};
+
+    size_type m_Capacity;
+    size_type m_Mask;
+    pointer m_Buffer;
+    Allocator m_Allocator;
+
+    // 每个槽位的状态序列号，用于协调生产者与消费者
+    std::unique_ptr<std::atomic<size_type>[]> m_Sequence;
+};
 
 // SPSC
 template<typename T>
