@@ -38,7 +38,6 @@ enum class level : uint8_t
 template <class Derived>
 struct category
 {
-	
 	constexpr std::string_view name() noexcept {
 		// 基类(Derived)必须要有 category_name 成员, 
 		// 且必须是可转换为 std::string_view 的静态常量表达式,
@@ -122,7 +121,7 @@ public:
 	template <typename ... Args>
 	static void log(level lvl, std::format_string<Args...> fmt, Args&& ... args, std::source_location loc = std::source_location::current())
 	{
-		if(self().m_running)
+		if(!self().m_running)
 		{
 			return ;
 		}
@@ -134,6 +133,7 @@ public:
 			std::vformat(fmt.get(), std::make_format_args(args...))
 		));
 	}
+
 	logger& start()
 	{
 		if (m_running.exchange(true)) 
@@ -174,32 +174,7 @@ public:
 
 		while(m_running)
 		{
-			message msg;
- 			while (batch.size() < BatchSize && m_msg_queue.try_pop(msg)) {
-                // 同时扇出到控制台/屏幕 Sinks（非文件）
-                for (auto& sink : m_sinks) {
-                    sink(msg);
-                }
-                batch.push_back(std::move(msg));
-            }
-
-			// 2. 判断是否需要提交批次
-            auto now = std::chrono::steady_clock::now();
-            bool batch_full = (batch.size() >= BatchSize);
-            bool timeout = (now - last_flush >= BatchTimeout) && !batch.empty();
-
-			if (batch_full || timeout) {
-                // 提交批次到文件写入线程
-                // 这里可以使用双缓冲或者其他机制
-
-				while (!m_batch_buffer.try_push(std::move(batch))) {
-                    // 若双缓冲满，等待文件线程消费（极短自旋）
-                    std::this_thread::yield();
-                }
-
-                batch.clear();
-                last_flush = now;
-            }
+			
 		}	
 	}
 
@@ -209,7 +184,8 @@ public:
 		// 每次运行生成一个新文件
 		auto file_path = std::filesystem::current_path() / std::format("game_{}.log", std::time(nullptr));
         std::ofstream file(file_path, std::ios::binary | std::ios::app);
-        if (!file.is_open()) {
+        if (!file.is_open()) 
+		{
             // 如果无法打开文件，直接丢弃所有块（可通知错误）
             return;
         }
@@ -234,7 +210,7 @@ private:
 	logger& operator=(logger&&) = delete;
 
 private:
-	ring_buffer<message, std::allocator<message>, ring_buffer_policy::MPSC> m_msg_queue;
+	ring_buffer<message, std::allocator<message>, ring_buffer_policy::MPSC> m_msg_queue {BufferSize};
 	double_buffer<message, BufferSize> m_batch_buffer;
 	dynamic_array<sink_callback> m_sinks; // 用于注册不同的日志输出方式, 例如控制台输出等
 	std::jthread m_worker_thread;

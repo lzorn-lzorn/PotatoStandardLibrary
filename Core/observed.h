@@ -43,14 +43,14 @@ public:
     // 默认构造：仅 Ty 可默认构造时可用
     constexpr Value_Storage()
         requires std::default_initializable<Ty>
-        : m_value()
+        : m_Value()
     {}
 
     // 原位构造
     template <typename... Args>
         requires std::constructible_from<Ty, Args...>
     constexpr explicit Value_Storage(std::in_place_t, Args&&... args)
-        : m_value(std::forward<Args>(args)...)
+        : m_Value(std::forward<Args>(args)...)
     {}
 
     // 平凡特殊成员
@@ -60,27 +60,27 @@ public:
     constexpr Value_Storage& operator=(const Value_Storage&) = default;
     constexpr Value_Storage& operator=(Value_Storage&&) = default;
 
-    [[nodiscard]] constexpr Ty& Value() noexcept { return m_value; }
-    [[nodiscard]] constexpr const Ty& Value() const noexcept { return m_value; }
+    [[nodiscard]] constexpr Ty& Value() noexcept { return m_Value; }
+    [[nodiscard]] constexpr const Ty& Value() const noexcept { return m_Value; }
     [[nodiscard]] constexpr bool has_value() const noexcept { return true; }
 
 protected:
     constexpr Ty& Assign(const Ty& val)
     {
-        m_value = val;
-        return m_value;
+        m_Value = val;
+        return m_Value;
     }
     constexpr Ty& Assign(Ty&& val)
 	{
 		if constexpr (std::is_move_assignable_v<Ty>)
-			m_value = std::move(val);
+			m_Value = std::move(val);
 		else
-			m_value = val;   // 回退到拷贝赋值
-		return m_value;
+			m_Value = val;   // 回退到拷贝赋值
+		return m_Value;
 	}
 
 private:
-    Ty m_value;
+    Ty m_Value;
 };
 
 template <typename Fn>
@@ -104,23 +104,23 @@ public:
     Observer_List()
     {
         Node* dummy = new Node{};
-        m_head.store(dummy, std::memory_order_relaxed);
-        m_tail.store(dummy, std::memory_order_relaxed);
+        m_Head.store(dummy, std::memory_order_relaxed);
+        m_Tail.store(dummy, std::memory_order_relaxed);
     }
 
     ~Observer_List()
     {
         Clear();
-        delete m_head.load(std::memory_order_relaxed);
+        delete m_Head.load(std::memory_order_relaxed);
     }
 
     Observer_List(const Observer_List& other)
     {
         Node* dummy = new Node{};
-        m_head.store(dummy, std::memory_order_relaxed);
-        m_tail.store(dummy, std::memory_order_relaxed);
+        m_Head.store(dummy, std::memory_order_relaxed);
+        m_Tail.store(dummy, std::memory_order_relaxed);
 
-        Node* cur = other.m_head.load(std::memory_order_acquire)->next.load(std::memory_order_acquire);
+        Node* cur = other.m_Head.load(std::memory_order_acquire)->next.load(std::memory_order_acquire);
         while (cur)
         {
             PushBack(cur->func);
@@ -129,12 +129,12 @@ public:
     }
 
     Observer_List(Observer_List&& other) noexcept
-        : m_head(other.m_head.load(std::memory_order_relaxed))
-        , m_tail(other.m_tail.load(std::memory_order_relaxed))
+        : m_Head(other.m_Head.load(std::memory_order_relaxed))
+        , m_Tail(other.m_Tail.load(std::memory_order_relaxed))
     {
         Node* dummy = new Node{};
-        other.m_head.store(dummy, std::memory_order_relaxed);
-        other.m_tail.store(dummy, std::memory_order_relaxed);
+        other.m_Head.store(dummy, std::memory_order_relaxed);
+        other.m_Tail.store(dummy, std::memory_order_relaxed);
     }
 
     Observer_List& operator=(const Observer_List& other)
@@ -149,14 +149,14 @@ public:
     {
         if (this == &other) return *this;
         Clear();
-        delete m_head.load(std::memory_order_relaxed);
+        delete m_Head.load(std::memory_order_relaxed);
 
-        m_head.store(other.m_head.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        m_tail.store(other.m_tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_Head.store(other.m_Head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_Tail.store(other.m_Tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
 
         Node* dummy = new Node{};
-        other.m_head.store(dummy, std::memory_order_relaxed);
-        other.m_tail.store(dummy, std::memory_order_relaxed);
+        other.m_Head.store(dummy, std::memory_order_relaxed);
+        other.m_Tail.store(dummy, std::memory_order_relaxed);
         return *this;
     }
 
@@ -172,7 +172,7 @@ public:
     template <typename Callback>
     void ForEach(Callback&& cb) const
     {
-        Node* cur = m_head.load(std::memory_order_acquire)->next.load(std::memory_order_acquire);
+        Node* cur = m_Head.load(std::memory_order_acquire)->next.load(std::memory_order_acquire);
         while (cur)
         {
             std::forward<Callback>(cb)(cur->func);
@@ -182,7 +182,7 @@ public:
 
     void Clear() noexcept
     {
-        Node* dummy = m_head.load(std::memory_order_relaxed);
+        Node* dummy = m_Head.load(std::memory_order_relaxed);
         Node* cur = dummy->next.load(std::memory_order_relaxed);
         while (cur)
         {
@@ -191,20 +191,20 @@ public:
             cur = next;
         }
         dummy->next.store(nullptr, std::memory_order_relaxed);
-        m_tail.store(dummy, std::memory_order_relaxed);
+        m_Tail.store(dummy, std::memory_order_relaxed);
     }
 
     void Swap(Observer_List& other) noexcept
 	{
-		// 不能使用 std::swap(m_head, other.m_head) —— std::atomic 不可移动
-		Node* my_head = m_head.load(std::memory_order_relaxed);
-		Node* my_tail = m_tail.load(std::memory_order_relaxed);
+		// 不能使用 std::swap(m_Head, other.m_Head) —— std::atomic 不可移动
+		Node* my_head = m_Head.load(std::memory_order_relaxed);
+		Node* my_tail = m_Tail.load(std::memory_order_relaxed);
 
-		m_head.store(other.m_head.load(std::memory_order_relaxed), std::memory_order_relaxed);
-		m_tail.store(other.m_tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		m_Head.store(other.m_Head.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		m_Tail.store(other.m_Tail.load(std::memory_order_relaxed), std::memory_order_relaxed);
 
-		other.m_head.store(my_head, std::memory_order_relaxed);
-		other.m_tail.store(my_tail, std::memory_order_relaxed);
+		other.m_Head.store(my_head, std::memory_order_relaxed);
+		other.m_Tail.store(my_tail, std::memory_order_relaxed);
 	}
 
 private:
@@ -213,28 +213,28 @@ private:
         node->next = nullptr;
         while (true)
         {
-            Node* tail = m_tail.load(std::memory_order_acquire);
+            Node* tail = m_Tail.load(std::memory_order_acquire);
             Node* next = tail->next.load(std::memory_order_acquire);
-            if (tail == m_tail.load(std::memory_order_acquire))
+            if (tail == m_Tail.load(std::memory_order_acquire))
             {
                 if (!next)
                 {
                     if (tail->next.compare_exchange_weak(next, node, std::memory_order_release))
                     {
-                        m_tail.compare_exchange_strong(tail, node, std::memory_order_release);
+                        m_Tail.compare_exchange_strong(tail, node, std::memory_order_release);
                         return;
                     }
                 }
                 else
                 {
-                    m_tail.compare_exchange_weak(tail, next, std::memory_order_release);
+                    m_Tail.compare_exchange_weak(tail, next, std::memory_order_release);
                 }
             }
         }
     }
 
-    std::atomic<Node*> m_head{nullptr};
-    std::atomic<Node*> m_tail{nullptr};
+    std::atomic<Node*> m_Head{nullptr};
+    std::atomic<Node*> m_Tail{nullptr};
 };;
 
 } // namespace core::details
