@@ -7,6 +7,8 @@
 #include <string_view>
 #include <format>
 #include <atomic>
+#include <utility>
+#include <cassert>
 
 #include "common.h"
 #include "std_interface.h"
@@ -41,13 +43,13 @@ private:
 
 		using pointer = std::conditional_t<IsConst, const basic_fixed_string*, basic_fixed_string*>;
 		using reference = std::conditional_t<IsConst, const value_type&, value_type&>;
-		using buffer_type = std::conditional_t<IsConst, const basic_fixed_string, basic_fixed_string>;
-		using value_type = std::conditional_t<IsConst, const value_type, value_type>;
+		using iterator_value = std::conditional_t<IsConst, const basic_fixed_string, basic_fixed_string>;
+		using value_type = std::conditional_t<IsConst, const CharType, CharType>;
 
-		buffer_type* m_Parent;
+		iterator_value* m_Parent;
 		size_type m_Offset;  // 从 head 开始的偏移
 
-		explicit iterator_impl(buffer_type* p, size_type off) 
+		explicit iterator_impl(iterator_value* p, size_type off) 
 			: m_Parent(p)
 			, m_Offset(off)
 		{
@@ -68,8 +70,7 @@ private:
 		
 		value_type& operator*() const noexcept
 		{
-			const size_type idx = (m_Parent->m_Head + m_Offset) & m_Parent->m_Mask;
-			return m_Parent->m_Buffer[idx];
+			return m_Parent->m_Buffer[m_Offset];
 		}
 
 		iterator_impl& operator++() { ++m_Offset; return *this; }
@@ -86,7 +87,7 @@ private:
 			return static_cast<difference_type>(a.m_Offset) - b.m_Offset;
 		}
 
-		value_type* operator->() const { return &**this; }
+		value_type* operator->() const { return &m_Parent->m_Buffer[m_Offset]; }
 		value_type& operator[](difference_type n) const { return *(*this + n); }
 
 		std::strong_ordering operator<=>(const iterator_impl&) const = default;
@@ -104,35 +105,48 @@ public:
 	basic_fixed_string() noexcept = default;
 	basic_fixed_string(const value_type* str) noexcept
 	{
-		
+		if (str) 
+		{
+            size_type len = traits_type::length(str);
+            size_type n = std::min(len, capacity());
+            traits_type::copy(m_Buffer, str, n);
+            m_Size = n;
+        }
+        m_Buffer[m_Size] = value_type(0);
 	}
 
 	template <typename Range>
 	basic_fixed_string(std::from_range_t, Range&& range) noexcept
 	{
-		
+		auto first = std::ranges::begin(range);
+		auto last = std::ranges::end(range);
+		size_type n = 0;
+		while (first != last && n < capacity()) 
+		{
+			m_Buffer[n++] = *first++;
+		}
+		m_Size = n;
+		m_Buffer[m_Size] = value_type(0);
 	}
 
 	basic_fixed_string(size_type count, value_type ch) noexcept
 	{
-
+		size_type n = std::min(count, capacity());
+        traits_type::assign(m_Buffer, n, ch);
+        m_Size = n;
+        m_Buffer[n] = value_type(0);
 	}
 
 	template <typename InputIter>
 	basic_fixed_string(InputIter first, InputIter last) noexcept
 	{
-		
-	}
-
-	template <typename Alloc = std::allocator<value_type>>
-	basic_fixed_string(std::basic_string<value_type, traits_type, Alloc> str) noexcept
-	{
-		
-	}
-
-	basic_fixed_string(std::basic_string_view<value_type, traits_type> str) noexcept
-	{
-		
+		size_type n = 0;
+		while (first != last && n < capacity()) 
+		{
+			m_Buffer[n++] = *first++;
+		}
+		m_Size = n;
+		m_Buffer[m_Size] = value_type(0);
 	}
 
 	basic_fixed_string(const basic_fixed_string&) = default;
@@ -140,25 +154,47 @@ public:
 	basic_fixed_string(basic_fixed_string&&) noexcept = default;
 	basic_fixed_string& operator=(basic_fixed_string&&) noexcept = default;
 
-	value_type& operator[](size_type pos) noexcept
-	{
-		
-	}
+	[[nodiscard]] constexpr size_type size()     const noexcept { return m_Size; }
+    [[nodiscard]] constexpr size_type capacity() const noexcept { return N - 1; }
+    [[nodiscard]] constexpr bool      empty()    const noexcept { return m_Size == 0; }
+
+	value_type&       operator[](size_type pos)       noexcept { return m_Buffer[pos]; }
+    const value_type& operator[](size_type pos) const noexcept { return m_Buffer[pos]; }
 
 	bool operator==(const basic_fixed_string& other) const noexcept
 	{
-		
+		return m_Size == other.m_Size &&
+               traits_type::compare(data(), other.data(), m_Size) == 0;
 	}
+
+	value_type& at(size_type pos) {
+        if (pos >= m_Size)
+        {
+			throw std::out_of_range("basic_fixed_string::at: pos out of range");
+		}
+        return m_Buffer[pos];
+    }
+    const value_type& at(size_type pos) const {
+        if (pos >= m_Size)
+        {
+			throw std::out_of_range("basic_fixed_string::at: pos out of range");
+		}
+        return m_Buffer[pos];
+    }
 
 	std::strong_ordering operator<=>(const basic_fixed_string& other) const noexcept
 	{
-		
+		size_type cmp_len = std::min(m_Size, other.m_Size);
+        int res = traits_type::compare(data(), other.data(), cmp_len);
+        if (res != 0)
+        {
+			return res < 0 ? std::strong_ordering::less : std::strong_ordering::greater;
+		}
+        return m_Size == other.m_Size ? std::strong_ordering::equal :
+               m_Size < other.m_Size  ? std::strong_ordering::less : std::strong_ordering::greater;
 	}
 public:
-	value_type at(size_type pos) const
-	{
-		
-	}
+
 
 	template <typename Alloc = std::allocator<value_type>>
 	size_type find(const std::basic_string<value_type, traits_type, Alloc>& str, size_type pos = 0) const noexcept
@@ -366,27 +402,21 @@ public:
 	template <typename OtherCharType, size_t M, typename OtherTraits = std::char_traits<OtherCharType>>
 	static basic_fixed_string<OtherCharType, M, OtherTraits> to_string(long double value) {}
 
-	void clear() noexcept {}
-
-	reference front() noexcept
+	void clear() noexcept 
 	{
-		
+		m_Size = 0;
+        m_Buffer[0] = value_type(0);
 	}
 
-	const_reference front() const noexcept
-	{
-		
-	}
+    reference       front()       noexcept { return m_Buffer[0]; }
+    const_reference front() const noexcept { return m_Buffer[0]; }
+    reference       back()        noexcept { return m_Buffer[m_Size - 1]; }
+    const_reference back()  const noexcept { return m_Buffer[m_Size - 1]; }
 
-	reference back() noexcept
-	{
-		
-	}
-
-	const_reference back() const noexcept
-	{
-		
-	}
+    // 数据访问（兼容标准库）
+    value_type*       data()       noexcept { return m_Buffer; }
+    const value_type* data() const noexcept { return m_Buffer; }
+    const value_type* c_str() const noexcept { return m_Buffer; }
 
 	[[nodiscard]] iterator begin() noexcept { return iterator(this, 0); }
 	[[nodiscard]] iterator end() noexcept { return iterator(this, size()); }
