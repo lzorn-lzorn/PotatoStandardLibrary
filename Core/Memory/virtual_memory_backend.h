@@ -94,4 +94,109 @@ public:
 
 };
 
+
+#if defined(_WIN32) || defined(_WIN64)
+#	include <windows.h>
+#	include <memoryapi.h>
+
+class windows_backend final : public virtual_memory_backend_interface
+{
+	static DWORD to_win_protect(virtual_memory_page_protection prot) 
+	{
+        switch (prot) 
+		{
+            case virtual_memory_page_protection::None:       return PAGE_NOACCESS;
+            case virtual_memory_page_protection::Read:       return PAGE_READONLY;
+            case virtual_memory_page_protection::ReadWrite:  return PAGE_READWRITE;
+            case virtual_memory_page_protection::NoAccess:   return PAGE_NOACCESS;
+        }
+        return PAGE_NOACCESS;
+    }
+	static SYSTEM_INFO get_system_info() {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        return si;
+    }
+
+public:
+	virtual ~windows_backend() = default;
+	// 保留地址空间并返回 virtual_region
+    // 成功时返回有效的区域；失败时抛出 std::system_error。
+    virtual_region reserve(const reserve_options& opts) override
+	{
+		
+	}
+
+    // 在已保留区域内提交从 offset 开始的 bytes 字节物理内存
+    // offset 和 bytes 会被调整为页面大小对齐
+    void commit(virtual_region& region, std::size_t offset, std::size_t bytes) override
+	{
+		
+	}
+
+    // 释放已提交的物理内存(保留地址空间不变)
+    void decommit(virtual_region& region, std::size_t offset, std::size_t bytes) override
+	{
+		
+	}
+
+    // 修改区域内存页的保护属性
+    void protect(virtual_region& region, std::size_t offset, std::size_t bytes, virtual_memory_page_protection prot) override
+	{
+		
+	}
+
+    // 完全释放该虚拟区域(释放所有提交的物理内存并归还地址空间)
+    void release(virtual_region& region) override
+	{
+		
+	}
+};
+
+#elif defined(__linux__)
+#	include <sys/mman.h>
+#	include <unistd.h>
+#	include <cerrno>
+#	include <system_error>
+
+class linux_backend final : public virtual_memory_backend_interface
+{
+
+public:
+	virtual ~linux_backend() = default;
+  	virtual_region reserve(const reserve_options& opts) override
+	{
+		
+	}
+
+    void commit(virtual_region& region, std::size_t offset, std::size_t bytes) override
+	{
+		
+	}
+
+    void decommit(virtual_region& region, std::size_t offset, std::size_t bytes) override
+	{
+		
+	}
+
+    void protect(virtual_region& region, std::size_t offset, std::size_t bytes, virtual_memory_page_protection prot) override
+	{
+		
+	}
+
+    void release(virtual_region& region) override
+	{
+		
+	}
+};
+#elif defined(__APPLE__)
+
+class apple_backend final : public virtual_memory_backend_interface
+{
+};
+#else
+
+#endif
+
+
 }
