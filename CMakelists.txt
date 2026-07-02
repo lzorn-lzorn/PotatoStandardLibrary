@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# 为 MSVC 添加 /utf-8，避免代码页编码警告 C4819
+add_compile_options(
+    "$<$<CXX_COMPILER_ID:MSVC>:/utf-8>"
+)
+
 option(POTATO_STANDARD_BUILD_TESTS "Build tests under Test/." ${PROJECT_IS_TOP_LEVEL})
 
 add_subdirectory(Core)

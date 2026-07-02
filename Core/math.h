@@ -26,6 +26,10 @@
 #endif
 
 #include "platform.h"
+
+#if defined(__MSVC__)
+#include <corecrt_math.h>
+#endif 
 namespace core::math
 {
 

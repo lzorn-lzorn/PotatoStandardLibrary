@@ -10,6 +10,7 @@
 #include <memory>
 #include <stdexcept>
 #include <array>
+#include <algorithm>
 // #include <thread>
 // #include <iostream>
 
@@ -129,7 +130,10 @@ public:
     ~ring_buffer()
 	{
         clear();  // 析构所有存活的元素
-        allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+        if (m_Buffer != nullptr)
+        {
+        	allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+        }
     }
 
     // 禁止拷贝（原子成员不可拷贝）
@@ -137,7 +141,7 @@ public:
     ring_buffer& operator=(const ring_buffer&) = delete;
 
     // 允许移动（但移动后源对象原子仍有效，需谨慎）
-    ring_buffer(ring_buffer&& other) noexcept
+	ring_buffer(ring_buffer&& other)
         : m_Capacity(other.m_Capacity)
 		, m_Head(other.m_Head)
 		, m_Tail(other.m_Tail)
@@ -172,7 +176,10 @@ public:
 		if (this != &other)
 		{
 			clear();
-			allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+            if (m_Buffer != nullptr)
+            {
+                allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+            }
 
 			if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
 			{
@@ -246,7 +253,7 @@ public:
     	return m_Buffer[idx];
     }
 
-    void pop_front() noexcept
+    void pop_front()
 	{
     	if (empty())
     	{
@@ -388,7 +395,6 @@ private:
 	template <bool IsConst>
 	class iterator_impl 
 	{
-		static_assert(false, "SPSC ring_buffer does not support iterators");
 	};
 
 public:
@@ -409,17 +415,20 @@ public:
 		m_Buffer = allocator_traits::allocate(m_Allocator, m_Capacity);
 	}
 
-	~ring_buffer()
+    ~ring_buffer()
 	{
 		clear();
-		allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+        if (m_Buffer != nullptr)
+        {
+            allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+        }
 	}
 
 	ring_buffer(const ring_buffer&) = delete;
 	ring_buffer& operator=(const ring_buffer&) = delete;
 
 	// 移动构造/赋值 noexcept
-	ring_buffer(ring_buffer&& other) noexcept
+    ring_buffer(ring_buffer&& other)
 		: m_Capacity(other.m_Capacity),
 		  m_Mask(other.m_Mask),
 		  m_Buffer(other.m_Buffer)
@@ -453,7 +462,10 @@ public:
 		if (this != &other)
 		{
 			clear();
-			allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+            if (m_Buffer != nullptr)
+            {
+                allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+            }
 
 			if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
 			{
@@ -625,7 +637,6 @@ public:
 		const size_type first_len = std::min(m_Capacity - h_idx, sz);
 		return {
 			std::span<const T>(m_Buffer + h_idx, first_len),
-			std::span<const T>(sz ? (m_Buffer + h_idx) : nullptr, first_len),
 			std::span<const T>(m_Buffer, sz - first_len)
 		};
 	}
@@ -660,7 +671,6 @@ private:
 	template <bool IsConst>
 	class iterator_impl 
 	{
-		static_assert(false, "MPSC ring_buffer does not support iterators");
 	};
 
 public:
@@ -686,13 +696,16 @@ public:
 	~ring_buffer()
     {
         clear();
-        allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+        if (m_Buffer != nullptr)
+        {
+        	allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+        }
     }
 
 	ring_buffer(const ring_buffer&) = delete;
     ring_buffer& operator=(const ring_buffer&) = delete;
 
-	ring_buffer(ring_buffer&& other) noexcept
+    ring_buffer(ring_buffer&& other)
         : m_Capacity(other.m_Capacity)
         , m_Mask(other.m_Mask)
         , m_Buffer(other.m_Buffer)
@@ -726,7 +739,10 @@ public:
         if (this != &other)
         {
             clear();
-            allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+			if (m_Buffer != nullptr)
+			{
+            	allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+			}
 
             if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
             {
@@ -937,7 +953,6 @@ private:
     template <bool IsConst>
     class iterator_impl 
     {
-        static_assert(false, "MPMC ring_buffer does not support iterators");
     };
 
 public:
@@ -970,13 +985,16 @@ public:
 	~ring_buffer()
     {
         clear();
-        allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+        if (m_Buffer != nullptr)
+        {
+        	allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+        }
     }
 
     ring_buffer(const ring_buffer&) = delete;
     ring_buffer& operator=(const ring_buffer&) = delete;
 
-	    ring_buffer(ring_buffer&& other) noexcept
+        ring_buffer(ring_buffer&& other)
         : m_Capacity(other.m_Capacity)
         , m_Mask(other.m_Mask)
         , m_Buffer(other.m_Buffer)
@@ -1007,7 +1025,10 @@ public:
         if (this != &other)
         {
             clear();
-            allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+			if (m_Buffer != nullptr)
+			{
+            	allocator_traits::deallocate(m_Allocator, m_Buffer, m_Capacity);
+			}
 
             if constexpr (allocator_traits::propagate_on_container_move_assignment::value)
             {
