@@ -72,3 +72,5 @@ Testing/
 .idea/
 .vscode/
 .vs/
+
+build_bench_timing
