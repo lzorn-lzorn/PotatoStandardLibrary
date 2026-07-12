@@ -1,15 +1,15 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <limits>
 #include <memory_resource>
 #include <mutex>
 #include <new>
-#include <unordered_map>
+#include <thread>
 #include <vector>
 
 #if !defined(_WIN32) && (defined(__linux__) || defined(__APPLE__))
@@ -18,6 +18,7 @@
 
 #include "Observability/memory_statistics.h"
 #include "thread_cache.h"
+#include "../mpmc_queue.h"
 
 namespace core::mem
 {
@@ -31,8 +32,15 @@ public:
 		: Config(InConfig)
 		, PageAllocator(Config)
 		, CentralPool(PageAllocator)
+		, ActiveDedicatedShardCount(determineShardCount(MaxDedicatedShardCount))
+		, ActiveQuarantineShardCount(determineShardCount(MaxQuarantineShardCount))
 	{
 		ThreadCacheRegistry::bind(CentralPool, Config);
+	}
+
+	~MemoryAllocatorEngine()
+	{
+		releaseDedicatedNodeChunks();
 	}
 
 	MemoryAllocatorEngine(const MemoryAllocatorEngine&) = delete;
@@ -57,7 +65,18 @@ public:
 
 	[[nodiscard]] void* allocate(const AllocationDescriptor& Descriptor)
 	{
-		if (Descriptor.Size == 0)
+		return allocateWithLifetime<AllocationLifetime::Default>(Descriptor);
+	}
+
+	void deallocate(void* Ptr, const AllocationDescriptor& Descriptor) noexcept
+	{
+		deallocateWithLifetime<AllocationLifetime::Default>(Ptr, Descriptor);
+	}
+
+	template <AllocationLifetime Lifetime>
+	[[nodiscard]] void* allocateWithLifetime(const AllocationDescriptor& Descriptor)
+	{
+		if (Descriptor.Size == 0) [[unlikely]]
 		{
 			return getZeroSizeAllocationPointer();
 		}
@@ -66,7 +85,8 @@ public:
 		Context.Descriptor = Descriptor;
 		Context.Runtime.Owner = this;
 
-		prepareContext(Context);
+		const bool HasObservers = EventBus.hasObservers();
+		prepareContext(Context, HasObservers);
 		if (!validateRequest(Context))
 		{
 			emitValidationFailure(Context);
@@ -79,7 +99,7 @@ public:
 			return nullptr;
 		}
 
-		if (!allocateRawBlock(Context))
+		if (!allocateRawBlock<Lifetime>(Context))
 		{
 			return nullptr;
 		}
@@ -91,7 +111,8 @@ public:
 		return Context.Runtime.UserPtr;
 	}
 
-	void deallocate(void* Ptr, const AllocationDescriptor& Descriptor) noexcept
+	template <AllocationLifetime Lifetime>
+	void deallocateWithLifetime(void* Ptr, const AllocationDescriptor& Descriptor) noexcept
 	{
 		if (!Ptr || isZeroSizeAllocationPointer(Ptr))
 		{
@@ -103,7 +124,8 @@ public:
 		Context.Runtime.Owner = this;
 		Context.Runtime.UserPtr = static_cast<std::byte*>(Ptr);
 
-		prepareContext(Context);
+		const bool HasObservers = EventBus.hasObservers();
+		prepareContext(Context, HasObservers);
 		if (!validateRequest(Context))
 		{
 			emitValidationFailure(Context);
@@ -124,7 +146,7 @@ public:
 
 		Context.Runtime.RawPtr = Context.Runtime.UserPtr - Context.Layout.UserOffset;
 		destroyLayout(Context);
-		freeSmallBlock(Context);
+		freeSmallBlock<Lifetime>(Context);
 		emitDeallocationEvent(Context);
 	}
 
@@ -166,14 +188,26 @@ public:
 			Descriptor.Alignment = Request.Alignment;
 			Descriptor.ResourceId = Request.ResourceId;
 			Descriptor.IsZeroMemory = Request.ZeroInitialize;
-			Descriptor.Lifetime = Request.Lifetime;
 
 			std::vector<void*> blocks;
 			blocks.reserve(Request.Count);
 
-			for (std::uint32_t i = 0; i < Request.Count; ++i)
+			for (std::uint32_t I = 0; I < Request.Count; ++I)
 			{
-				void* Ptr = allocate(Descriptor);
+				void* Ptr = nullptr;
+				switch (Request.Lifetime)
+				{
+				case AllocationLifetime::Persistent:
+					Ptr = allocateWithLifetime<AllocationLifetime::Persistent>(Descriptor);
+					break;
+				case AllocationLifetime::Transient:
+					Ptr = allocateWithLifetime<AllocationLifetime::Transient>(Descriptor);
+					break;
+				default:
+					Ptr = allocateWithLifetime<AllocationLifetime::Default>(Descriptor);
+					break;
+				}
+
 				if (!Ptr)
 				{
 					break;
@@ -185,7 +219,18 @@ public:
 
 			for (void* Ptr : blocks)
 			{
-				deallocate(Ptr, Descriptor);
+				switch (Request.Lifetime)
+				{
+				case AllocationLifetime::Persistent:
+					deallocateWithLifetime<AllocationLifetime::Persistent>(Ptr, Descriptor);
+					break;
+				case AllocationLifetime::Transient:
+					deallocateWithLifetime<AllocationLifetime::Transient>(Ptr, Descriptor);
+					break;
+				default:
+					deallocateWithLifetime<AllocationLifetime::Default>(Ptr, Descriptor);
+					break;
+				}
 			}
 		}
 
@@ -201,49 +246,63 @@ public:
 
 	[[nodiscard]] RuntimeStats getRuntimeStats() noexcept
 	{
-		RuntimeStats stats;
+		AllocatorRuntimeStatsInputs Inputs;
 		const auto pageToSpanStats = CentralPool.getPageToSpanPoolStats();
-		stats.PageToSpanEntryCount = pageToSpanStats.EntryCount;
-		stats.PageToSpanLevel1NodesUsed = pageToSpanStats.Level1NodesUsed;
-		stats.PageToSpanLevel1NodesCapacity = pageToSpanStats.Level1NodesCapacity;
-		stats.PageToSpanLevel1UsageRatio = pageToSpanStats.Level1UsageRatio;
-		stats.PageToSpanLevel2NodesUsed = pageToSpanStats.Level2NodesUsed;
-		stats.PageToSpanLevel2NodesCapacity = pageToSpanStats.Level2NodesCapacity;
-		stats.PageToSpanLevel2UsageRatio = pageToSpanStats.Level2UsageRatio;
-		stats.PageToSpanPoolExhaustionWarningCount = pageToSpanStats.PoolExhaustionWarningCount;
-		stats.SpanObjectPoolAllocated = pageToSpanStats.SpanObjectsAllocated;
-		stats.SpanObjectPoolInUse = pageToSpanStats.SpanObjectsInUse;
-		stats.SpanObjectPoolUsageRatio = pageToSpanStats.SpanObjectPoolUsageRatio;
+		Inputs.PageToSpanEntryCount = pageToSpanStats.EntryCount;
+		Inputs.PageToSpanLevel1NodesUsed = pageToSpanStats.Level1NodesUsed;
+		Inputs.PageToSpanLevel1NodesCapacity = pageToSpanStats.Level1NodesCapacity;
+		Inputs.PageToSpanLevel1UsageRatio = pageToSpanStats.Level1UsageRatio;
+		Inputs.PageToSpanLevel2NodesUsed = pageToSpanStats.Level2NodesUsed;
+		Inputs.PageToSpanLevel2NodesCapacity = pageToSpanStats.Level2NodesCapacity;
+		Inputs.PageToSpanLevel2UsageRatio = pageToSpanStats.Level2UsageRatio;
+		Inputs.PageToSpanPoolExhaustionWarningCount = pageToSpanStats.PoolExhaustionWarningCount;
+		Inputs.SpanObjectPoolAllocated = pageToSpanStats.SpanObjectsAllocated;
+		Inputs.SpanObjectPoolInUse = pageToSpanStats.SpanObjectsInUse;
+		Inputs.SpanObjectPoolUsageRatio = pageToSpanStats.SpanObjectPoolUsageRatio;
 
 		const auto regionIndexStats = PageAllocator.getRegionIndexPoolStats();
-		stats.RegionIndexRegionCount = regionIndexStats.RegionCount;
-		stats.RegionIndexEntryCount = regionIndexStats.EntryCount;
-		stats.RegionIndexLevel1NodesUsed = regionIndexStats.Level1NodesUsed;
-		stats.RegionIndexLevel1NodesCapacity = regionIndexStats.Level1NodesCapacity;
-		stats.RegionIndexLevel1UsageRatio = regionIndexStats.Level1UsageRatio;
-		stats.RegionIndexLevel2NodesUsed = regionIndexStats.Level2NodesUsed;
-		stats.RegionIndexLevel2NodesCapacity = regionIndexStats.Level2NodesCapacity;
-		stats.RegionIndexLevel2UsageRatio = regionIndexStats.Level2UsageRatio;
-		stats.RegionIndexPoolExhaustionWarningCount = regionIndexStats.PoolExhaustionWarningCount;
+		Inputs.RegionIndexRegionCount = regionIndexStats.RegionCount;
+		Inputs.RegionIndexEntryCount = regionIndexStats.EntryCount;
+		Inputs.RegionIndexLevel1NodesUsed = regionIndexStats.Level1NodesUsed;
+		Inputs.RegionIndexLevel1NodesCapacity = regionIndexStats.Level1NodesCapacity;
+		Inputs.RegionIndexLevel1UsageRatio = regionIndexStats.Level1UsageRatio;
+		Inputs.RegionIndexLevel2NodesUsed = regionIndexStats.Level2NodesUsed;
+		Inputs.RegionIndexLevel2NodesCapacity = regionIndexStats.Level2NodesCapacity;
+		Inputs.RegionIndexLevel2UsageRatio = regionIndexStats.Level2UsageRatio;
+		Inputs.RegionIndexPoolExhaustionWarningCount = regionIndexStats.PoolExhaustionWarningCount;
 
 		{
-			std::lock_guard Lock(DedicatedMutex);
-			stats.DedicatedAllocationCount = DedicatedAllocations.size();
+			for (std::size_t I = 0; I < ActiveDedicatedShardCount; ++I)
+			{
+				DedicatedAllocationShard& Shard = DedicatedAllocationShards[I];
+				std::lock_guard<SpinLock> Lock(Shard.Mutex);
+				Inputs.DedicatedAllocationCount += Shard.Allocations.size();
+			}
 		}
 
 		{
-			std::lock_guard Lock(DedicatedCacheMutex);
-			stats.DedicatedCacheBucketCount = DedicatedRegionCache.size();
-			stats.DedicatedCacheBytes = DedicatedCacheBytes;
+			for (std::size_t I = 0; I < DedicatedCacheBucketCount; ++I)
+			{
+				DedicatedRegionCacheBucket& Bucket = DedicatedRegionCache[I];
+				std::lock_guard<SpinLock> Lock(Bucket.Mutex);
+				if (Bucket.SizeKey != 0 && Bucket.Count > 0)
+				{
+					++Inputs.DedicatedCacheBucketCount;
+				}
+			}
+			Inputs.DedicatedCacheBytes = DedicatedCacheBytes.load(std::memory_order_relaxed);
 		}
 
 		{
-			std::lock_guard Lock(QuarantineMutex);
-			stats.QuarantineEntryCount = SmallBlockQuarantine.size();
-			stats.QuarantineBytes = QuarantineBytes;
+			for (std::size_t I = 0; I < ActiveQuarantineShardCount; ++I)
+			{
+				QuarantineShard& Shard = QuarantineShards[I];
+				Inputs.QuarantineEntryCount += Shard.Entries.size();
+				Inputs.QuarantineBytes += Shard.Bytes.load(std::memory_order_relaxed);
+			}
 		}
 
-		return stats;
+		return AllocatorRuntimeStatsCollector::collect(Inputs);
 	}
 
 private:
@@ -269,6 +328,45 @@ private:
 		AllocationLifetime Lifetime = AllocationLifetime::Default;
 	};
 
+	static constexpr std::size_t MaxDedicatedShardCount = tuning::MemoryFacadeMaxDedicatedShardCount;
+	static constexpr std::size_t MaxQuarantineShardCount = tuning::MemoryFacadeMaxQuarantineShardCount;
+	static constexpr std::size_t DedicatedCacheBucketCount = tuning::MemoryFacadeDedicatedCacheBucketCount;
+	static constexpr std::size_t DedicatedCacheBucketCapacity =
+		tuning::MemoryFacadeDedicatedCacheBucketCapacity;
+	static constexpr std::size_t QuarantineRingCapacity = tuning::MemoryFacadeQuarantineRingCapacity;
+
+	struct DedicatedAllocationNode
+	{
+		DedicatedAllocation Record;
+		DedicatedAllocationNode* NextFree = nullptr;
+	};
+
+	struct DedicatedAllocationNodeChunk
+	{
+		DedicatedAllocationNode* Nodes = nullptr;
+		DedicatedAllocationNodeChunk* Next = nullptr;
+	};
+
+	struct DedicatedAllocationShard
+	{
+		SpinLock Mutex;
+		core::containers::RadixTreeMap<DedicatedAllocationNode*, 16, 16, 10, 10, 64, 1024> Allocations;
+	};
+
+	struct QuarantineShard
+	{
+		core::mpmc_queue<SmallBlockQuarantineEntry, QuarantineRingCapacity> Entries;
+		std::atomic<std::size_t> Bytes = 0;
+	};
+
+	struct DedicatedRegionCacheBucket
+	{
+		SpinLock Mutex;
+		std::size_t SizeKey = 0;
+		std::uint16_t Count = 0;
+		std::array<VirtualRegion, DedicatedCacheBucketCapacity> Regions{};
+	};
+
 	static AllocatorConfig& getGlobalConfig()
 	{
 		static AllocatorConfig Config;
@@ -292,16 +390,32 @@ private:
 		return Ptr == getZeroSizeAllocationPointer();
 	}
 
-	void prepareContext(AllocationContext& Context)
+	void prepareContext(AllocationContext& Context, const bool FillObserverMetadata)
 	{
 		Context.Stage = AllocationStage::Prepare;
-		Context.Metadata.ThreadId = std::this_thread::get_id();
-		Context.Metadata.Timestamp = timestampNs();
-		Context.Metadata.AllocationId = NextAllocationId.fetch_add(1, std::memory_order_relaxed);
+		Context.Metadata.AllocationId = generateAllocationId();
 		Context.Metadata.ResourceId = Context.Descriptor.ResourceId;
 		Context.Metadata.FrameIndex = Context.Descriptor.FrameIndex != 0
 			? Context.Descriptor.FrameIndex
 			: CurrentFrame.load(std::memory_order_relaxed);
+
+		if (!FillObserverMetadata)
+		{
+			Context.Metadata.ThreadId = {};
+			Context.Metadata.Timestamp = 0;
+			Context.Metadata.StackId = 0;
+			return;
+		}
+
+		Context.Metadata.ThreadId = std::this_thread::get_id();
+		if constexpr (MemoryCompileEnableDebugGuards)
+		{
+			Context.Metadata.Timestamp = timestampNs();
+		}
+		else
+		{
+			Context.Metadata.Timestamp = 0;
+		}
 		Context.Metadata.StackId = captureStackId();
 	}
 
@@ -343,8 +457,8 @@ private:
 			Context.Layout.BackGuard = 16;
 		}
 
-		const std::size_t prefix = Context.Layout.HeaderSize + Context.Layout.FrontGuard;
-		Context.Layout.UserOffset = alignUp(prefix, Context.Descriptor.Alignment);
+		const std::size_t Prefix = Context.Layout.HeaderSize + Context.Layout.FrontGuard;
+		Context.Layout.UserOffset = alignUp(Prefix, Context.Descriptor.Alignment);
 
 		std::size_t Total = 0;
 		if (!checkedAdd(Context.Layout.UserOffset, Context.Descriptor.Size, Total))
@@ -361,16 +475,15 @@ private:
 
 		Context.Layout.TotalSize = Total;
 
-		const bool small_alignment = Context.Descriptor.Alignment <= alignof(std::max_align_t);
-		if (small_alignment)
+		const bool IsSmallAlignment = Context.Descriptor.Alignment <= alignof(std::max_align_t);
+		if (IsSmallAlignment)
 		{
-			const std::uint16_t classIndex = sizeToClassIndex(Total);
-			if (classIndex != InvalidSizeClass)
+			const std::uint16_t ClassIndex = sizeToClassIndex(Total);
+			if (ClassIndex != InvalidSizeClass)
 			{
-				const SizeClass classInfo = CentralPool.getSizeClassInfo(classIndex);
-				Context.Layout.SizeClassIndex = classIndex;
-				Context.Layout.BlockSize = classInfo.BlockSize;
-				Context.Layout.TotalSize = classInfo.BlockSize;
+				Context.Layout.SizeClassIndex = ClassIndex;
+				Context.Layout.BlockSize = classIndexToSize(ClassIndex);
+				Context.Layout.TotalSize = Context.Layout.BlockSize;
 				Context.Layout.IsSmallAllocation = true;
 				return true;
 			}
@@ -389,13 +502,14 @@ private:
 		return true;
 	}
 
+	template <AllocationLifetime Lifetime>
 	[[nodiscard]] bool allocateRawBlock(AllocationContext& Context)
 	{
 		Context.Stage = AllocationStage::Allocate;
 
 		if (Context.Layout.IsSmallAllocation)
 		{
-			if (Context.Descriptor.Lifetime == AllocationLifetime::Persistent)
+			if constexpr (Lifetime == AllocationLifetime::Persistent)
 			{
 				void* Block = nullptr;
 				const std::uint32_t fetched = CentralPool.fetchBatch(
@@ -416,29 +530,29 @@ private:
 				Context.Result.IsSuccess = true;
 				return true;
 			}
-
-			ThreadCache& Cache = ThreadCacheRegistry::get();
-			const ThreadCacheAllocation decision = Cache.allocate(
-				Context.Layout.SizeClassIndex,
-				Context.Layout.BlockSize);
-
-			if (!decision.Block)
+			else
 			{
-				Context.Result.ErrorCode = std::make_error_code(std::errc::not_enough_memory);
-				return false;
-			}
+				ThreadCache& Cache = ThreadCacheRegistry::get();
+				const ThreadCacheAllocation Decision = Cache.allocate(
+					Context.Layout.SizeClassIndex,
+					Context.Layout.BlockSize);
 
-			Context.Runtime.RawPtr = static_cast<std::byte*>(decision.Block);
-			Context.Runtime.UserPtr = Context.Runtime.RawPtr + Context.Layout.UserOffset;
-			Context.Runtime.IsFromThreadCache = decision.Hit;
-			Context.Runtime.IsFromCentralPool = decision.FromCentral;
-			Context.Result.IsSuccess = true;
-			return true;
+				if (!Decision.Block)
+				{
+					Context.Result.ErrorCode = std::make_error_code(std::errc::not_enough_memory);
+					return false;
+				}
+
+				Context.Runtime.RawPtr = static_cast<std::byte*>(Decision.Block);
+				Context.Runtime.UserPtr = Context.Runtime.RawPtr + Context.Layout.UserOffset;
+				Context.Runtime.IsFromThreadCache = Decision.Hit;
+				Context.Runtime.IsFromCentralPool = Decision.FromCentral;
+				Context.Result.IsSuccess = true;
+				return true;
+			}
 		}
 
-		VirtualRegion Region = acquireDedicatedRegion(
-			Context.Layout.TotalSize,
-			Context.Descriptor.Lifetime);
+		VirtualRegion Region = acquireDedicatedRegion<Lifetime>(Context.Layout.TotalSize);
 
 		if (!Region.isValid())
 		{
@@ -479,11 +593,28 @@ private:
 		Record.UserOffset = UserOffset;
 		Record.RequestedSize = Context.Descriptor.Size;
 		Record.RequestedAlignment = Context.Descriptor.Alignment;
-		Record.Lifetime = Context.Descriptor.Lifetime;
+		Record.Lifetime = Lifetime;
+
+		DedicatedAllocationNode* Node = acquireDedicatedAllocationNode();
+		if (!Node)
+		{
+			VirtualMemoryManager::release(Region);
+			Context.Result.ErrorCode = std::make_error_code(std::errc::not_enough_memory);
+			return false;
+		}
+		Node->Record = Record;
 
 		{
-			std::lock_guard Lock(DedicatedMutex);
-			DedicatedAllocations[Context.Runtime.UserPtr] = Record;
+			DedicatedAllocationShard& Shard = getDedicatedAllocationShard(Context.Runtime.UserPtr);
+			std::lock_guard<SpinLock> Lock(Shard.Mutex);
+			const std::uint64_t Key = dedicatedAllocationKey(Context.Runtime.UserPtr);
+			if (!Shard.Allocations.insertOrAssign(Key, Node))
+			{
+				releaseDedicatedAllocationNode(Node);
+				VirtualMemoryManager::release(Region);
+				Context.Result.ErrorCode = std::make_error_code(std::errc::not_enough_memory);
+				return false;
+			}
 		}
 
 		Context.Result.IsSuccess = true;
@@ -498,7 +629,7 @@ private:
 		{
 			std::memset(Context.Runtime.UserPtr, 0, Context.Descriptor.Size);
 		}
-		else
+		else if constexpr (MemoryCompileEnableDebugGuards)
 		{
 			std::memset(Context.Runtime.UserPtr, AllocatedPattern, Context.Descriptor.Size);
 		}
@@ -540,7 +671,6 @@ private:
 		Context.Stage = AllocationStage::Destroy;
 		if constexpr (!MemoryCompileEnableDebugGuards)
 		{
-			std::memset(Context.Runtime.UserPtr, FreedPattern, Context.Descriptor.Size);
 			return;
 		}
 
@@ -552,9 +682,9 @@ private:
 		if (IsHeaderOk)
 		{
 			const std::byte* front_guard = Context.Runtime.RawPtr + Context.Layout.HeaderSize;
-			for (std::size_t i = 0; i < Context.Layout.FrontGuard; ++i)
+			for (std::size_t I = 0; I < Context.Layout.FrontGuard; ++I)
 			{
-				if (static_cast<std::uint8_t>(front_guard[i]) != FrontGuardPattern)
+				if (static_cast<std::uint8_t>(front_guard[I]) != FrontGuardPattern)
 				{
 					IsGuardsOk = false;
 					break;
@@ -563,10 +693,10 @@ private:
 
 			if (IsGuardsOk)
 			{
-				const std::byte* back_guard = Context.Runtime.UserPtr + Context.Descriptor.Size;
-				for (std::size_t i = 0; i < Context.Layout.BackGuard; ++i)
+				const std::byte* BackGuard = Context.Runtime.UserPtr + Context.Descriptor.Size;
+				for (std::size_t I = 0; I < Context.Layout.BackGuard; ++I)
 				{
-					if (static_cast<std::uint8_t>(back_guard[i]) != BackGuardPattern)
+					if (static_cast<std::uint8_t>(BackGuard[I]) != BackGuardPattern)
 					{
 						IsGuardsOk = false;
 						break;
@@ -584,42 +714,44 @@ private:
 		std::memset(Context.Runtime.UserPtr, FreedPattern, Context.Descriptor.Size);
 	}
 
+	template <AllocationLifetime Lifetime>
 	void freeSmallBlock(AllocationContext& Context)
 	{
 		Context.Stage = AllocationStage::Free;
 		if (shouldQuarantineSmallBlock(Context))
 		{
-			enqueueSmallBlockQuarantine(Context);
+			enqueueSmallBlockQuarantine<Lifetime>(Context);
 			return;
 		}
 
-		releaseSmallBlock(
+		releaseSmallBlock<Lifetime>(
 			Context.Layout.SizeClassIndex,
 			Context.Layout.BlockSize,
-			Context.Runtime.RawPtr,
-			Context.Descriptor.Lifetime);
+			Context.Runtime.RawPtr);
 	}
 
 	[[nodiscard]] bool releaseDedicatedBlock(AllocationContext& Context) noexcept
 	{
 		DedicatedAllocation Record;
 		{
-			std::lock_guard Lock(DedicatedMutex);
-			auto Iter = DedicatedAllocations.find(Context.Runtime.UserPtr);
-			if (Iter == DedicatedAllocations.end())
+			DedicatedAllocationShard& Shard = getDedicatedAllocationShard(Context.Runtime.UserPtr);
+			std::lock_guard<SpinLock> Lock(Shard.Mutex);
+			const std::uint64_t Key = dedicatedAllocationKey(Context.Runtime.UserPtr);
+			DedicatedAllocationNode* Node = Shard.Allocations.find(Key);
+			if (!Node)
 			{
 				return false;
 			}
 
-			Record = Iter->second;
-			DedicatedAllocations.erase(Iter);
+			Record = Node->Record;
+			Shard.Allocations.erase(Key);
+			releaseDedicatedAllocationNode(Node);
 		}
 
 		Context.Layout.UserOffset = Record.UserOffset;
 		Context.Layout.TotalSize = Record.Region.ReservedSize;
 		Context.Descriptor.Size = Record.RequestedSize;
 		Context.Descriptor.Alignment = Record.RequestedAlignment;
-		Context.Descriptor.Lifetime = Record.Lifetime;
 		Context.Runtime.RawPtr = Record.Region.Base;
 		Context.Runtime.IsFromOS = true;
 
@@ -630,25 +762,27 @@ private:
 		return true;
 	}
 
+	template <AllocationLifetime Lifetime>
 	void releaseSmallBlock(
 		const std::uint16_t SizeClassIndex,
 		const std::size_t BlockSize,
-		std::byte* RawPtr,
-		const AllocationLifetime Lifetime)
+		std::byte* RawPtr)
 	{
 		if (!RawPtr || SizeClassIndex == InvalidSizeClass)
 		{
 			return;
 		}
 
-		if (Lifetime == AllocationLifetime::Persistent)
+		if constexpr (Lifetime == AllocationLifetime::Persistent)
 		{
 			*reinterpret_cast<void**>(RawPtr) = nullptr;
 			CentralPool.returnBatch(SizeClassIndex, RawPtr, 1);
 			return;
 		}
-
-		ThreadCacheRegistry::get().deallocate(SizeClassIndex, BlockSize, RawPtr);
+		else
+		{
+			ThreadCacheRegistry::get().deallocate(SizeClassIndex, BlockSize, RawPtr);
+		}
 	}
 
 	[[nodiscard]] bool shouldQuarantineSmallBlock(const AllocationContext& Context) const noexcept
@@ -661,6 +795,7 @@ private:
 		return Context.Layout.IsSmallAllocation && Context.Runtime.RawPtr != nullptr;
 	}
 
+	template <AllocationLifetime Lifetime>
 	void enqueueSmallBlockQuarantine(const AllocationContext& Context)
 	{
 		SmallBlockQuarantineEntry Entry;
@@ -672,38 +807,50 @@ private:
 		Entry.AllocationId = Context.Metadata.AllocationId;
 		Entry.FrameIndex = Context.Metadata.FrameIndex;
 		Entry.ResourceId = Context.Metadata.ResourceId;
-		Entry.Lifetime = Context.Descriptor.Lifetime;
+		Entry.Lifetime = Lifetime;
+		QuarantineShard& Shard = getQuarantineShardForCurrentThread();
+		if (!Shard.Entries.try_push(Entry))
+		{
+			const auto Popped = Shard.Entries.try_pop();
+			if (Popped)
+			{
+				const SmallBlockQuarantineEntry Evicted = *Popped;
+				Shard.Bytes.fetch_sub(Evicted.BlockSize, std::memory_order_relaxed);
+				releaseSingleQuarantineEntry(Evicted);
+			}
+
+			if (!Shard.Entries.try_push(Entry))
+			{
+				releaseSmallBlock<Lifetime>(
+					Entry.SizeClassIndex,
+					Entry.BlockSize,
+					Entry.RawPtr);
+				return;
+			}
+		}
+
+		Shard.Bytes.fetch_add(Entry.BlockSize, std::memory_order_relaxed);
 
 		if constexpr (MemoryCompileQuarantineReleaseOnlyOnFlush)
 		{
-			std::lock_guard Lock(QuarantineMutex);
-			SmallBlockQuarantine.push_back(Entry);
-			QuarantineBytes += Entry.BlockSize;
 			return;
 		}
 
-		std::vector<SmallBlockQuarantineEntry> released;
-		{
-			std::lock_guard Lock(QuarantineMutex);
-			SmallBlockQuarantine.push_back(Entry);
-			QuarantineBytes += Entry.BlockSize;
-			collectQuarantineReleasesLocked(released, false);
-		}
-
-		releaseQuarantineEntries(released);
+		drainQuarantineShard(Shard, false);
 	}
 
-	void collectQuarantineReleasesLocked(
-		std::vector<SmallBlockQuarantineEntry>& Released,
-		const bool ForceAll)
+	void drainQuarantineShard(QuarantineShard& Shard, const bool ForceAll)
 	{
-		while (!SmallBlockQuarantine.empty())
+		const std::size_t ByteLimit = quarantineByteLimitPerShard();
+		const std::size_t EntryLimit = quarantineEntryLimitPerShard();
+
+		for (;;)
 		{
 			if (!ForceAll)
 			{
-				const bool overBytes = QuarantineBytes > Config.UseAfterFreeQuarantineBytes;
-				const bool overEntries =
-					SmallBlockQuarantine.size() > Config.UseAfterFreeQuarantineMaxEntries;
+				const std::size_t Bytes = Shard.Bytes.load(std::memory_order_relaxed);
+				const bool overBytes = Bytes > ByteLimit;
+				const bool overEntries = Shard.Entries.size() > EntryLimit;
 
 				if (!overBytes && !overEntries)
 				{
@@ -711,38 +858,54 @@ private:
 				}
 			}
 
-			SmallBlockQuarantineEntry Entry = SmallBlockQuarantine.front();
-			SmallBlockQuarantine.pop_front();
-			QuarantineBytes = QuarantineBytes >= Entry.BlockSize
-				? QuarantineBytes - Entry.BlockSize
-				: 0;
-			Released.push_back(Entry);
+			const auto Popped = Shard.Entries.try_pop();
+			if (!Popped)
+			{
+				break;
+			}
+
+			const SmallBlockQuarantineEntry Entry = *Popped;
+			Shard.Bytes.fetch_sub(Entry.BlockSize, std::memory_order_relaxed);
+			releaseSingleQuarantineEntry(Entry);
 		}
 	}
 
-	void releaseQuarantineEntries(const std::vector<SmallBlockQuarantineEntry>& Entries)
+	void releaseSingleQuarantineEntry(const SmallBlockQuarantineEntry& Entry)
 	{
-		for (const SmallBlockQuarantineEntry& Entry : Entries)
+		if (!isQuarantinePatternIntact(Entry))
 		{
-			if (!isQuarantinePatternIntact(Entry))
-			{
-				emitUseAfterFree(Entry);
-			}
+			emitUseAfterFree(Entry);
+		}
 
-			releaseSmallBlock(
+		switch (Entry.Lifetime)
+		{
+		case AllocationLifetime::Persistent:
+			releaseSmallBlock<AllocationLifetime::Persistent>(
 				Entry.SizeClassIndex,
 				Entry.BlockSize,
-				Entry.RawPtr,
-				Entry.Lifetime);
+				Entry.RawPtr);
+			break;
+		case AllocationLifetime::Transient:
+			releaseSmallBlock<AllocationLifetime::Transient>(
+				Entry.SizeClassIndex,
+				Entry.BlockSize,
+				Entry.RawPtr);
+			break;
+		default:
+			releaseSmallBlock<AllocationLifetime::Default>(
+				Entry.SizeClassIndex,
+				Entry.BlockSize,
+				Entry.RawPtr);
+			break;
 		}
 	}
 
 	[[nodiscard]] bool isQuarantinePatternIntact(const SmallBlockQuarantineEntry& Entry) const noexcept
 	{
 		const std::uint8_t* Bytes = reinterpret_cast<const std::uint8_t*>(Entry.RawPtr + Entry.UserOffset);
-		for (std::size_t i = 0; i < Entry.UserSize; ++i)
+		for (std::size_t I = 0; I < Entry.UserSize; ++I)
 		{
-			if (Bytes[i] != FreedPattern)
+			if (Bytes[I] != FreedPattern)
 			{
 				return false;
 			}
@@ -753,31 +916,46 @@ private:
 
 	void flushQuarantine() noexcept
 	{
-		std::vector<SmallBlockQuarantineEntry> released;
+		for (std::size_t I = 0; I < ActiveQuarantineShardCount; ++I)
 		{
-			std::lock_guard Lock(QuarantineMutex);
-			collectQuarantineReleasesLocked(released, true);
+			QuarantineShard& Shard = QuarantineShards[I];
+			drainQuarantineShard(Shard, true);
 		}
-
-		releaseQuarantineEntries(released);
 	}
 
-	[[nodiscard]] VirtualRegion acquireDedicatedRegion(
-		const std::size_t Bytes,
-		const AllocationLifetime Lifetime)
+	template <AllocationLifetime Lifetime>
+	[[nodiscard]] VirtualRegion acquireDedicatedRegion(const std::size_t Bytes)
 	{
-		if (Config.EnableDedicatedRegionCache && Lifetime == AllocationLifetime::Transient)
+		if constexpr (Lifetime == AllocationLifetime::Transient)
 		{
-			std::lock_guard Lock(DedicatedCacheMutex);
-			auto Iter = DedicatedRegionCache.find(Bytes);
-			if (Iter != DedicatedRegionCache.end() && !Iter->second.empty())
+			if (Config.EnableDedicatedRegionCache)
 			{
-				VirtualRegion Region = Iter->second.back();
-				Iter->second.pop_back();
-				DedicatedCacheBytes = DedicatedCacheBytes >= Region.ReservedSize
-					? DedicatedCacheBytes - Region.ReservedSize
-					: 0;
-				return Region;
+				constexpr std::size_t MaxProbe = tuning::MemoryFacadeDedicatedCacheMaxProbe;
+				for (std::size_t Probe = 0; Probe < MaxProbe; ++Probe)
+				{
+					DedicatedRegionCacheBucket& Bucket =
+						DedicatedRegionCache[(dedicatedRegionCacheBucketIndex(Bytes) + Probe) % DedicatedCacheBucketCount];
+					std::lock_guard<SpinLock> Lock(Bucket.Mutex);
+
+					if (Bucket.Count == 0 && Bucket.SizeKey != 0 && Bucket.SizeKey != Bytes)
+					{
+						Bucket.SizeKey = Bytes;
+					}
+
+					if (Bucket.SizeKey == Bytes && Bucket.Count > 0)
+					{
+						VirtualRegion Region = Bucket.Regions[Bucket.Count - 1];
+						Bucket.Regions[Bucket.Count - 1] = {};
+						--Bucket.Count;
+						DedicatedCacheBytes.fetch_sub(Region.ReservedSize, std::memory_order_relaxed);
+						return Region;
+					}
+
+					if (Bucket.SizeKey == 0)
+					{
+						break;
+					}
+				}
 			}
 		}
 
@@ -796,15 +974,45 @@ private:
 
 		if (Config.EnableDedicatedRegionCache && Lifetime == AllocationLifetime::Transient)
 		{
-			std::lock_guard Lock(DedicatedCacheMutex);
-
-			auto& bucket = DedicatedRegionCache[Region.ReservedSize];
-			if (bucket.size() < Config.DedicatedRegionCacheMaxEntriesPerSize &&
-				DedicatedCacheBytes + Region.ReservedSize <= Config.DedicatedRegionCacheLimitBytes)
+			constexpr std::size_t MaxProbe = tuning::MemoryFacadeDedicatedCacheMaxProbe;
+			for (std::size_t Probe = 0; Probe < MaxProbe; ++Probe)
 			{
+				DedicatedRegionCacheBucket& Bucket = DedicatedRegionCache[
+					(dedicatedRegionCacheBucketIndex(Region.ReservedSize) + Probe) % DedicatedCacheBucketCount];
+				std::lock_guard<SpinLock> Lock(Bucket.Mutex);
+
+				if (Bucket.Count == 0 && Bucket.SizeKey != 0 && Bucket.SizeKey != Region.ReservedSize)
+				{
+					Bucket.SizeKey = Region.ReservedSize;
+				}
+
+				if (Bucket.SizeKey != 0 && Bucket.SizeKey != Region.ReservedSize)
+				{
+					continue;
+				}
+
+				if (Bucket.SizeKey == 0)
+				{
+					Bucket.SizeKey = Region.ReservedSize;
+				}
+
+				const std::size_t BucketLimit = std::min<std::size_t>(
+					DedicatedCacheBucketCapacity,
+					Config.DedicatedRegionCacheMaxEntriesPerSize);
+				if (Bucket.Count >= BucketLimit)
+				{
+					break;
+				}
+
+				const std::size_t CurrentCachedBytes = DedicatedCacheBytes.load(std::memory_order_relaxed);
+				if (CurrentCachedBytes + Region.ReservedSize > Config.DedicatedRegionCacheLimitBytes)
+				{
+					break;
+				}
+
 				VirtualMemoryManager::decommit(Region, 0, Region.ReservedSize);
-				bucket.push_back(Region);
-				DedicatedCacheBytes += Region.ReservedSize;
+				Bucket.Regions[Bucket.Count++] = Region;
+				DedicatedCacheBytes.fetch_add(Region.ReservedSize, std::memory_order_relaxed);
 				Region = {};
 				return;
 			}
@@ -941,7 +1149,14 @@ private:
 		Event.Size = Entry.UserSize;
 		Event.Alignment = 0;
 		Event.AllocationId = Entry.AllocationId;
-		Event.Timestamp = timestampNs();
+		if constexpr (MemoryCompileEnableDebugGuards)
+		{
+			Event.Timestamp = timestampNs();
+		}
+		else
+		{
+			Event.Timestamp = 0;
+		}
 		Event.ThreadId = std::this_thread::get_id();
 		Event.FrameIndex = Entry.FrameIndex;
 		Event.ResourceId = Entry.ResourceId;
@@ -957,42 +1172,196 @@ private:
 		}
 
 #if defined(_WIN32)
-		void* frames[16]{};
-		const USHORT count = ::RtlCaptureStackBackTrace(2, 16, frames, nullptr);
-		std::uint64_t hash = 1469598103934665603ull;
-		for (USHORT i = 0; i < count; ++i)
+		void* Frames[16]{};
+		const USHORT count = ::RtlCaptureStackBackTrace(2, 16, Frames, nullptr);
+		std::uint64_t Hash = 1469598103934665603ull;
+		for (USHORT I = 0; I < count; ++I)
 		{
-			hash ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(frames[i]));
-			hash *= 1099511628211ull;
+			Hash ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Frames[I]));
+			Hash *= 1099511628211ull;
 		}
-		return static_cast<std::uint32_t>(hash ^ (hash >> 32));
+		return static_cast<std::uint32_t>(Hash ^ (Hash >> 32));
 #elif defined(__linux__) || defined(__APPLE__)
-		void* frames[16]{};
-		const int count = ::backtrace(frames, 16);
-		std::uint64_t hash = 1469598103934665603ull;
-		for (int i = 0; i < count; ++i)
+		void* Frames[16]{};
+		const int count = ::backtrace(Frames, 16);
+		std::uint64_t Hash = 1469598103934665603ull;
+		for (int I = 0; I < count; ++I)
 		{
-			hash ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(frames[i]));
-			hash *= 1099511628211ull;
+			Hash ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Frames[I]));
+			Hash *= 1099511628211ull;
 		}
-		return static_cast<std::uint32_t>(hash ^ (hash >> 32));
+		return static_cast<std::uint32_t>(Hash ^ (Hash >> 32));
 #else
 		return 0;
 #endif
 	}
 
-	[[nodiscard]] static bool checkedAdd(
-		const std::size_t left,
-		const std::size_t right,
-		std::size_t& out) noexcept
+	[[nodiscard]] static std::uint64_t generateAllocationId() noexcept
 	{
-		if (left > std::numeric_limits<std::size_t>::max() - right)
+		thread_local std::uint32_t LocalCounter = 0;
+		thread_local const std::uint32_t ThreadIdHash =
+			static_cast<std::uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+
+		const std::uint32_t Counter = LocalCounter++;
+		return (static_cast<std::uint64_t>(ThreadIdHash) << 32) |
+			static_cast<std::uint64_t>(Counter);
+	}
+
+	[[nodiscard]] static std::size_t determineShardCount(const std::size_t MaxShardCount) noexcept
+	{
+		const std::size_t Hardware = std::thread::hardware_concurrency();
+		const std::size_t Desired = Hardware == 0
+			? tuning::MemoryFacadeMinShardCount
+			: Hardware * tuning::MemoryFacadeShardScale;
+		return std::max<std::size_t>(
+			tuning::MemoryFacadeMinShardCount,
+			std::min<std::size_t>(Desired, MaxShardCount));
+	}
+
+	[[nodiscard]] static std::uint64_t dedicatedAllocationKey(const void* Ptr) noexcept
+	{
+		return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Ptr));
+	}
+
+	[[nodiscard]] DedicatedAllocationNode* acquireDedicatedAllocationNode() noexcept
+	{
+		std::lock_guard Lock(DedicatedNodePoolMutex);
+		if (!DedicatedNodeFreeList && !growDedicatedNodePoolLocked())
 		{
-			out = 0;
+			return nullptr;
+		}
+
+		DedicatedAllocationNode* Node = DedicatedNodeFreeList;
+		DedicatedNodeFreeList = Node ? Node->NextFree : nullptr;
+		if (Node)
+		{
+			Node->NextFree = nullptr;
+		}
+		return Node;
+	}
+
+	void releaseDedicatedAllocationNode(DedicatedAllocationNode* Node) noexcept
+	{
+		if (!Node)
+		{
+			return;
+		}
+
+		std::lock_guard Lock(DedicatedNodePoolMutex);
+		Node->Record = {};
+		Node->NextFree = DedicatedNodeFreeList;
+		DedicatedNodeFreeList = Node;
+	}
+
+	[[nodiscard]] bool growDedicatedNodePoolLocked()
+	{
+		constexpr std::size_t ChunkNodeCount = tuning::MemoryFacadeDedicatedNodeChunkSize;
+		DedicatedAllocationNodeChunk* Chunk =
+			new (std::nothrow) DedicatedAllocationNodeChunk();
+		if (!Chunk)
+		{
 			return false;
 		}
 
-		out = left + right;
+		Chunk->Nodes = new (std::nothrow) DedicatedAllocationNode[ChunkNodeCount]();
+		if (!Chunk->Nodes)
+		{
+			delete Chunk;
+			return false;
+		}
+
+		for (std::size_t I = 0; I < ChunkNodeCount; ++I)
+		{
+			Chunk->Nodes[I].Record = {};
+			Chunk->Nodes[I].NextFree = DedicatedNodeFreeList;
+			DedicatedNodeFreeList = &Chunk->Nodes[I];
+		}
+
+		Chunk->Next = DedicatedNodeChunks;
+		DedicatedNodeChunks = Chunk;
+		return true;
+	}
+
+	void releaseDedicatedNodeChunks() noexcept
+	{
+		std::lock_guard Lock(DedicatedNodePoolMutex);
+		DedicatedAllocationNodeChunk* Chunk = DedicatedNodeChunks;
+		while (Chunk)
+		{
+			DedicatedAllocationNodeChunk* Next = Chunk->Next;
+			delete[] Chunk->Nodes;
+			delete Chunk;
+			Chunk = Next;
+		}
+
+		DedicatedNodeChunks = nullptr;
+		DedicatedNodeFreeList = nullptr;
+	}
+
+	[[nodiscard]] static std::size_t dedicatedRegionCacheBucketIndex(const std::size_t Size) noexcept
+	{
+		const std::size_t Mixed = Size ^ (Size >> 7) ^ (Size >> 13);
+		return Mixed % DedicatedCacheBucketCount;
+	}
+
+	[[nodiscard]] std::size_t dedicatedShardIndex(const void* Ptr) const noexcept
+	{
+		if (ActiveDedicatedShardCount <= 1)
+		{
+			return 0;
+		}
+
+		const std::uintptr_t Address = reinterpret_cast<std::uintptr_t>(Ptr);
+		const std::size_t Mixed = static_cast<std::size_t>((Address >> 4) ^ (Address >> 16));
+		return Mixed % ActiveDedicatedShardCount;
+	}
+
+	[[nodiscard]] DedicatedAllocationShard& getDedicatedAllocationShard(const void* Ptr) noexcept
+	{
+		return DedicatedAllocationShards[dedicatedShardIndex(Ptr)];
+	}
+
+	[[nodiscard]] std::size_t quarantineShardIndexForCurrentThread() const noexcept
+	{
+		if (ActiveQuarantineShardCount <= 1)
+		{
+			return 0;
+		}
+
+		thread_local const std::size_t ThreadHash =
+			static_cast<std::size_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+		return ThreadHash % ActiveQuarantineShardCount;
+	}
+
+	[[nodiscard]] QuarantineShard& getQuarantineShardForCurrentThread() noexcept
+	{
+		return QuarantineShards[quarantineShardIndexForCurrentThread()];
+	}
+
+	[[nodiscard]] std::size_t quarantineByteLimitPerShard() const noexcept
+	{
+		const std::size_t ShardCount = std::max<std::size_t>(1, ActiveQuarantineShardCount);
+		return std::max<std::size_t>(1, Config.UseAfterFreeQuarantineBytes / ShardCount);
+	}
+
+	[[nodiscard]] std::size_t quarantineEntryLimitPerShard() const noexcept
+	{
+		const std::size_t ShardCount = std::max<std::size_t>(1, ActiveQuarantineShardCount);
+		return std::max<std::size_t>(1, Config.UseAfterFreeQuarantineMaxEntries / ShardCount);
+	}
+
+	[[nodiscard]] static bool checkedAdd(
+		const std::size_t Left,
+		const std::size_t Right,
+		std::size_t& Out) noexcept
+	{
+		if (Left > std::numeric_limits<std::size_t>::max() - Right)
+		{
+			Out = 0;
+			return false;
+		}
+
+		Out = Left + Right;
 		return true;
 	}
 
@@ -1001,19 +1370,18 @@ private:
 	CentralPool CentralPool;
 	MemoryEventBus EventBus;
 
-	std::atomic<std::uint64_t> NextAllocationId = 1;
 	std::atomic<std::uint32_t> CurrentFrame = 0;
+	std::size_t ActiveDedicatedShardCount = tuning::MemoryFacadeMinShardCount;
+	std::array<DedicatedAllocationShard, MaxDedicatedShardCount> DedicatedAllocationShards{};
+	std::mutex DedicatedNodePoolMutex;
+	DedicatedAllocationNode* DedicatedNodeFreeList = nullptr;
+	DedicatedAllocationNodeChunk* DedicatedNodeChunks = nullptr;
 
-	std::mutex DedicatedMutex;
-	std::unordered_map<void*, DedicatedAllocation> DedicatedAllocations;
+	std::array<DedicatedRegionCacheBucket, DedicatedCacheBucketCount> DedicatedRegionCache{};
+	std::atomic<std::size_t> DedicatedCacheBytes = 0;
 
-	std::mutex DedicatedCacheMutex;
-	std::unordered_map<std::size_t, std::vector<VirtualRegion>> DedicatedRegionCache;
-	std::size_t DedicatedCacheBytes = 0;
-
-	std::mutex QuarantineMutex;
-	std::deque<SmallBlockQuarantineEntry> SmallBlockQuarantine;
-	std::size_t QuarantineBytes = 0;
+	std::size_t ActiveQuarantineShardCount = tuning::MemoryFacadeMinShardCount;
+	std::array<QuarantineShard, MaxQuarantineShardCount> QuarantineShards{};
 };
 
 class AllocatorFacade
@@ -1052,7 +1420,35 @@ public:
 		const std::size_t Alignment = alignof(std::max_align_t),
 		const std::uint32_t ResourceId = 0,
 		const bool ZeroMemory = false,
-		const AllocationLifetime Lifetime = AllocationLifetime::Default,
+		const bool IsNoThrow = false)
+	{
+		return allocateWithLifetime<AllocationLifetime::Default>(
+			Size,
+			Alignment,
+			ResourceId,
+			ZeroMemory,
+			IsNoThrow);
+	}
+
+	/**
+	 * @brief Allocate memory with transient/persistent lifetime decided at compile-time.
+	 * @param
+	 *     - Size        std::size_t   Requested bytes.
+	 *     - Alignment   std::size_t   Required alignment.
+	 *     - ResourceId  std::uint32_t Optional resource grouping id.
+	 *     - ZeroMemory  bool          Whether user payload should be zero-filled.
+	 *     - IsNoThrow   bool          Return nullptr instead of throwing on failure.
+	 * @usage
+	 *     - Internal facade helper used by default/transient/persistent entry points.
+	 * @return
+	 *     - void*  User payload pointer.
+	 */
+	template <AllocationLifetime Lifetime>
+	[[nodiscard]] static void* allocateWithLifetime(
+		const std::size_t Size,
+		const std::size_t Alignment = alignof(std::max_align_t),
+		const std::uint32_t ResourceId = 0,
+		const bool ZeroMemory = false,
 		const bool IsNoThrow = false)
 	{
 		AllocationDescriptor Descriptor;
@@ -1061,9 +1457,8 @@ public:
 		Descriptor.IsZeroMemory = ZeroMemory;
 		Descriptor.IsNoThrow = IsNoThrow;
 		Descriptor.ResourceId = ResourceId;
-		Descriptor.Lifetime = Lifetime;
 
-		void* Ptr = MemoryAllocatorEngine::Self().allocate(Descriptor);
+		void* Ptr = MemoryAllocatorEngine::Self().allocateWithLifetime<Lifetime>(Descriptor);
 		if (!Ptr && !Descriptor.IsNoThrow)
 		{
 			throw std::bad_alloc();
@@ -1088,10 +1483,9 @@ public:
 		const std::size_t Size,
 		const std::size_t Alignment = alignof(std::max_align_t),
 		const std::uint32_t ResourceId = 0,
-		const bool ZeroMemory = false,
-		const AllocationLifetime Lifetime = AllocationLifetime::Default) noexcept
+		const bool ZeroMemory = false) noexcept
 	{
-		return allocate(Size, Alignment, ResourceId, ZeroMemory, Lifetime, true);
+		return allocate(Size, Alignment, ResourceId, ZeroMemory, true);
 	}
 
 	/**
@@ -1110,8 +1504,33 @@ public:
 		void* Ptr,
 		const std::size_t Size,
 		const std::size_t Alignment = alignof(std::max_align_t),
-		const std::uint32_t ResourceId = 0,
-		const AllocationLifetime Lifetime = AllocationLifetime::Default) noexcept
+		const std::uint32_t ResourceId = 0) noexcept
+	{
+		deallocateWithLifetime<AllocationLifetime::Default>(
+			Ptr,
+			Size,
+			Alignment,
+			ResourceId);
+	}
+
+	/**
+	 * @brief Free memory using compile-time lifetime dispatch.
+	 * @param
+	 *     - Ptr         void*         Pointer returned by matching allocate path.
+	 *     - Size        std::size_t   Original requested Size.
+	 *     - Alignment   std::size_t   Original Alignment.
+	 *     - ResourceId  std::uint32_t Optional resource grouping id.
+	 * @usage
+	 *     - Internal facade helper used by default/transient/persistent free APIs.
+	 * @return
+	 *     - void
+	 */
+	template <AllocationLifetime Lifetime>
+	static void deallocateWithLifetime(
+		void* Ptr,
+		const std::size_t Size,
+		const std::size_t Alignment = alignof(std::max_align_t),
+		const std::uint32_t ResourceId = 0) noexcept
 	{
 		if (!Ptr)
 		{
@@ -1122,8 +1541,7 @@ public:
 		Descriptor.Size = Size;
 		Descriptor.Alignment = Alignment;
 		Descriptor.ResourceId = ResourceId;
-		Descriptor.Lifetime = Lifetime;
-		MemoryAllocatorEngine::Self().deallocate(Ptr, Descriptor);
+		MemoryAllocatorEngine::Self().deallocateWithLifetime<Lifetime>(Ptr, Descriptor);
 	}
 
 	/**
@@ -1145,7 +1563,12 @@ public:
 		const bool ZeroMemory = false,
 		const bool IsNoThrow = false)
 	{
-		return allocate(Size, Alignment, ResourceId, ZeroMemory, AllocationLifetime::Transient, IsNoThrow);
+		return allocateWithLifetime<AllocationLifetime::Transient>(
+			Size,
+			Alignment,
+			ResourceId,
+			ZeroMemory,
+			IsNoThrow);
 	}
 
 	/**
@@ -1167,7 +1590,12 @@ public:
 		const bool ZeroMemory = false,
 		const bool IsNoThrow = false)
 	{
-		return allocate(Size, Alignment, ResourceId, ZeroMemory, AllocationLifetime::Persistent, IsNoThrow);
+		return allocateWithLifetime<AllocationLifetime::Persistent>(
+			Size,
+			Alignment,
+			ResourceId,
+			ZeroMemory,
+			IsNoThrow);
 	}
 
 	/**
@@ -1188,7 +1616,11 @@ public:
 		const std::size_t Alignment = alignof(std::max_align_t),
 		const std::uint32_t ResourceId = 0) noexcept
 	{
-		deallocate(Ptr, Size, Alignment, ResourceId, AllocationLifetime::Transient);
+		deallocateWithLifetime<AllocationLifetime::Transient>(
+			Ptr,
+			Size,
+			Alignment,
+			ResourceId);
 	}
 
 	/**
@@ -1209,7 +1641,11 @@ public:
 		const std::size_t Alignment = alignof(std::max_align_t),
 		const std::uint32_t ResourceId = 0) noexcept
 	{
-		deallocate(Ptr, Size, Alignment, ResourceId, AllocationLifetime::Persistent);
+		deallocateWithLifetime<AllocationLifetime::Persistent>(
+			Ptr,
+			Size,
+			Alignment,
+			ResourceId);
 	}
 
 	template <typename ObserverType>

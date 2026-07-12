@@ -57,6 +57,76 @@ struct AllocatorRuntimeStatsSnapshot
 	std::size_t RegionIndexPoolExhaustionWarningCount = 0;
 };
 
+struct AllocatorRuntimeStatsInputs
+{
+	std::size_t DedicatedAllocationCount = 0;
+	std::size_t DedicatedCacheBucketCount = 0;
+	std::size_t DedicatedCacheBytes = 0;
+	std::size_t QuarantineEntryCount = 0;
+	std::size_t QuarantineBytes = 0;
+
+	std::size_t PageToSpanEntryCount = 0;
+	std::size_t PageToSpanLevel1NodesUsed = 0;
+	std::size_t PageToSpanLevel1NodesCapacity = 0;
+	double PageToSpanLevel1UsageRatio = 0.0;
+	std::size_t PageToSpanLevel2NodesUsed = 0;
+	std::size_t PageToSpanLevel2NodesCapacity = 0;
+	double PageToSpanLevel2UsageRatio = 0.0;
+	std::size_t PageToSpanPoolExhaustionWarningCount = 0;
+
+	std::size_t SpanObjectPoolAllocated = 0;
+	std::size_t SpanObjectPoolInUse = 0;
+	double SpanObjectPoolUsageRatio = 0.0;
+
+	std::size_t RegionIndexRegionCount = 0;
+	std::size_t RegionIndexEntryCount = 0;
+	std::size_t RegionIndexLevel1NodesUsed = 0;
+	std::size_t RegionIndexLevel1NodesCapacity = 0;
+	double RegionIndexLevel1UsageRatio = 0.0;
+	std::size_t RegionIndexLevel2NodesUsed = 0;
+	std::size_t RegionIndexLevel2NodesCapacity = 0;
+	double RegionIndexLevel2UsageRatio = 0.0;
+	std::size_t RegionIndexPoolExhaustionWarningCount = 0;
+};
+
+class AllocatorRuntimeStatsCollector
+{
+public:
+	[[nodiscard]] static AllocatorRuntimeStatsSnapshot collect(const AllocatorRuntimeStatsInputs& Inputs) noexcept
+	{
+		AllocatorRuntimeStatsSnapshot Snapshot;
+		Snapshot.DedicatedAllocationCount = Inputs.DedicatedAllocationCount;
+		Snapshot.DedicatedCacheBucketCount = Inputs.DedicatedCacheBucketCount;
+		Snapshot.DedicatedCacheBytes = Inputs.DedicatedCacheBytes;
+		Snapshot.QuarantineEntryCount = Inputs.QuarantineEntryCount;
+		Snapshot.QuarantineBytes = Inputs.QuarantineBytes;
+
+		Snapshot.PageToSpanEntryCount = Inputs.PageToSpanEntryCount;
+		Snapshot.PageToSpanLevel1NodesUsed = Inputs.PageToSpanLevel1NodesUsed;
+		Snapshot.PageToSpanLevel1NodesCapacity = Inputs.PageToSpanLevel1NodesCapacity;
+		Snapshot.PageToSpanLevel1UsageRatio = Inputs.PageToSpanLevel1UsageRatio;
+		Snapshot.PageToSpanLevel2NodesUsed = Inputs.PageToSpanLevel2NodesUsed;
+		Snapshot.PageToSpanLevel2NodesCapacity = Inputs.PageToSpanLevel2NodesCapacity;
+		Snapshot.PageToSpanLevel2UsageRatio = Inputs.PageToSpanLevel2UsageRatio;
+		Snapshot.PageToSpanPoolExhaustionWarningCount = Inputs.PageToSpanPoolExhaustionWarningCount;
+
+		Snapshot.SpanObjectPoolAllocated = Inputs.SpanObjectPoolAllocated;
+		Snapshot.SpanObjectPoolInUse = Inputs.SpanObjectPoolInUse;
+		Snapshot.SpanObjectPoolUsageRatio = Inputs.SpanObjectPoolUsageRatio;
+
+		Snapshot.RegionIndexRegionCount = Inputs.RegionIndexRegionCount;
+		Snapshot.RegionIndexEntryCount = Inputs.RegionIndexEntryCount;
+		Snapshot.RegionIndexLevel1NodesUsed = Inputs.RegionIndexLevel1NodesUsed;
+		Snapshot.RegionIndexLevel1NodesCapacity = Inputs.RegionIndexLevel1NodesCapacity;
+		Snapshot.RegionIndexLevel1UsageRatio = Inputs.RegionIndexLevel1UsageRatio;
+		Snapshot.RegionIndexLevel2NodesUsed = Inputs.RegionIndexLevel2NodesUsed;
+		Snapshot.RegionIndexLevel2NodesCapacity = Inputs.RegionIndexLevel2NodesCapacity;
+		Snapshot.RegionIndexLevel2UsageRatio = Inputs.RegionIndexLevel2UsageRatio;
+		Snapshot.RegionIndexPoolExhaustionWarningCount = Inputs.RegionIndexPoolExhaustionWarningCount;
+		return Snapshot;
+	}
+};
+
 class MemoryStatisticsObserver
 {
 public:

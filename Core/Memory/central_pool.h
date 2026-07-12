@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <array>
 #include <algorithm>
 #include <cstddef>
@@ -10,7 +9,6 @@
 #include <memory>
 #include <mutex>
 #include <new>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -35,10 +33,22 @@ inline constexpr std::array<std::uint32_t, 56> SizeClasses = {
 inline constexpr std::size_t NumSizeClasses = SizeClasses.size();
 inline constexpr std::size_t MaxSmallAllocation = SizeClasses.back();
 inline constexpr std::size_t ClassQuantum = 8;
+static_assert((ClassQuantum & (ClassQuantum - 1)) == 0, "ClassQuantum must be power-of-two");
+inline constexpr std::size_t ClassQuantumShift = [] {
+	std::size_t Shift = 0;
+	std::size_t Value = ClassQuantum;
+	while (Value > 1)
+	{
+		Value >>= 1;
+		++Shift;
+	}
+	return Shift;
+}();
 inline constexpr std::size_t ClassLookupCount = (MaxSmallAllocation / ClassQuantum) + 1;
-inline constexpr std::size_t MaxRetainedEmptySpansPerClass = 2;
-inline constexpr std::size_t CentralPoolBucketShardCount = 16;
-inline constexpr std::size_t MaxReturnBatchGroups = 8;
+inline constexpr std::size_t MaxRetainedEmptySpansPerClass = tuning::CentralPoolMaxRetainedEmptySpansPerClass;
+inline constexpr std::size_t CentralPoolBucketMaxShardCount = tuning::CentralPoolBucketMaxShardCount;
+inline constexpr std::size_t CentralPoolPageMapShardCount = tuning::CentralPoolPageMapShardCount;
+inline constexpr std::size_t MaxReturnBatchGroups = tuning::CentralPoolMaxReturnBatchGroups;
 
 inline std::array<std::uint16_t, ClassLookupCount> buildSizeClassLookup()
 {
@@ -46,10 +56,10 @@ inline std::array<std::uint16_t, ClassLookupCount> buildSizeClassLookup()
 
 	for (std::size_t Bucket = 0; Bucket < lookup.size(); ++Bucket)
 	{
-		const std::size_t size = Bucket * ClassQuantum;
+		const std::size_t Size = Bucket * ClassQuantum;
 		std::uint16_t class_index = 0;
 
-		while (class_index + 1 < NumSizeClasses && SizeClasses[class_index] < size)
+		while (class_index + 1 < NumSizeClasses && SizeClasses[class_index] < Size)
 		{
 			++class_index;
 		}
@@ -62,20 +72,20 @@ inline std::array<std::uint16_t, ClassLookupCount> buildSizeClassLookup()
 
 inline const std::array<std::uint16_t, ClassLookupCount> SizeClassLookup = buildSizeClassLookup();
 
-[[nodiscard]] inline std::uint16_t sizeToClassIndex(const std::size_t size) noexcept
+[[nodiscard]] inline std::uint16_t sizeToClassIndex(const std::size_t Size) noexcept
 {
-	if (size == 0 || size > MaxSmallAllocation)
+	if (Size == 0 || Size > MaxSmallAllocation) [[unlikely]]
 	{
 		return InvalidSizeClass;
 	}
 
-	const std::size_t Bucket = (size + ClassQuantum - 1) / ClassQuantum;
+	const std::size_t Bucket = (Size + ClassQuantum - 1) >> ClassQuantumShift;
 	return SizeClassLookup[Bucket];
 }
 
 [[nodiscard]] inline std::size_t classIndexToSize(const std::uint16_t ClassIndex) noexcept
 {
-	if (ClassIndex >= NumSizeClasses)
+	if (ClassIndex >= NumSizeClasses) [[unlikely]]
 	{
 		return 0;
 	}
@@ -133,24 +143,21 @@ public:
 	explicit CentralPool(PageAllocator& pageAllocator)
 		: PageAllocator(&pageAllocator)
 		, PageSize(pageAllocator.getPageSize())
+		, ActiveBucketShardCount(determineBucketShardCount())
 	{
 		for (std::size_t i = 0; i < NumSizeClasses; ++i)
 		{
 			Classes[i] = buildSizeClass(pageAllocator.getPageSize(), SizeClasses[i]);
 		}
-
-		SpanLookupSnapshotState.store(
-			std::make_shared<const SpanLookupSnapshot>(),
-			std::memory_order_release);
 	}
 
 	CentralPool(const CentralPool&) = delete;
 	CentralPool& operator=(const CentralPool&) = delete;
 
 	/**
-	 * @brief Fetch a Block batch from one size class into thread-local cache.
+	 * @brief Fetch a Block Batch from one Size class into thread-local cache.
 	 * @param
-	 *     - SizeClassIndex  std::uint16_t  Target size-class index.
+	 *     - SizeClassIndex  std::uint16_t  Target Size-class index.
 	 *     - OutBlocks       void**         Caller-provided output Block array.
 	 *     - MaxBlocks       std::uint32_t  Maximum Blocks to fetch.
 	 * @usage
@@ -161,7 +168,8 @@ public:
 	[[nodiscard]] std::uint32_t fetchBatch(
 		const std::uint16_t SizeClassIndex,
 		void** OutBlocks,
-		const std::uint32_t MaxBlocks)
+		const std::uint32_t MaxBlocks,
+		Span** OutSpanHint = nullptr)
 	{
 		if (SizeClassIndex >= NumSizeClasses || !OutBlocks || MaxBlocks == 0)
 		{
@@ -221,23 +229,32 @@ public:
 			SpanObj->IsInPartialList = false;
 		}
 
+		if (OutSpanHint)
+		{
+			*OutSpanHint = SpanObj;
+		}
+
 		return Allocated;
 	}
 
 	/**
-	 * @brief Return a linked Block batch back to one central size class.
+	 * @brief Return a linked Block Batch back to one central Size class.
 	 * @param
-	 *     - SizeClassIndex  std::uint16_t  Target size-class index.
+	 *     - SizeClassIndex  std::uint16_t  Target Size-class index.
 	 *     - Head            void*          Intrusive single-link Head pointer.
-	 *     - count           std::uint32_t  Number of Blocks in chain.
+	 *     - Count           std::uint32_t  Number of Blocks in chain.
 	 * @usage
 	 *     - Called by ThreadCache when local freelist is over target capacity.
 	 * @return
 	 *     - void
 	 */
-	void returnBatch(const std::uint16_t SizeClassIndex, void* Head, const std::uint32_t count)
+	void returnBatch(
+		const std::uint16_t SizeClassIndex,
+		void* Head,
+		const std::uint32_t Count,
+		Span* InitialHint = nullptr)
 	{
-		if (SizeClassIndex >= NumSizeClasses || !Head || count == 0)
+		if (SizeClassIndex >= NumSizeClasses || !Head || Count == 0)
 		{
 			return;
 		}
@@ -253,23 +270,23 @@ public:
 			std::uint16_t ShardIndex = 0;
 		};
 
-		std::array<SpanBatch, MaxReturnBatchGroups> batches{};
-		std::size_t batchCount = 0;
+		std::array<SpanBatch, MaxReturnBatchGroups> Batches{};
+		std::size_t BatchCount = 0;
 
-		auto findBatch = [&](Span* SpanObj) -> SpanBatch*
+		auto FindBatch = [&](Span* SpanObj) -> SpanBatch*
 		{
-			for (std::size_t i = 0; i < batchCount; ++i)
+			for (std::size_t i = 0; i < BatchCount; ++i)
 			{
-				if (batches[i].SpanObj == SpanObj)
+				if (Batches[i].SpanObj == SpanObj)
 				{
-					return &batches[i];
+					return &Batches[i];
 				}
 			}
 
 			return nullptr;
 		};
 
-		auto flushSingleBlock = [&](Span* SpanObj, void* Block) {
+		auto FlushSingleBlock = [&](Span* SpanObj, void* Block) {
 			if (!SpanObj || !Block)
 			{
 				return;
@@ -281,65 +298,66 @@ public:
 			trimEmptySpansLocked(Shard);
 		};
 
-		void* current = Head;
-		Span* spanHint = nullptr;
-		for (std::uint32_t i = 0; i < count && current; ++i)
+		void* Current = Head;
+		Span* SpanHint = InitialHint;
+		for (std::uint32_t i = 0; i < Count && Current; ++i)
 		{
-			void* next = *reinterpret_cast<void**>(current);
-			Span* SpanObj = findSpanHinted(current, spanHint, SizeClassIndex);
+			void* Next = *reinterpret_cast<void**>(Current);
+			Span* SpanObj = findSpanHinted(Current, SpanHint, SizeClassIndex);
+
 			if (!SpanObj || SpanObj->IsReleased)
 			{
-				current = next;
+				Current = Next;
 				continue;
 			}
 
-			SpanBatch* batch = findBatch(SpanObj);
-			if (!batch)
+			SpanBatch* Batch = FindBatch(SpanObj);
+			if (!Batch)
 			{
-				if (batchCount < batches.size())
+				if (BatchCount < Batches.size())
 				{
-					batch = &batches[batchCount++];
-					batch->SpanObj = SpanObj;
-					batch->ShardIndex = SpanObj->BucketShardIndex;
+					Batch = &Batches[BatchCount++];
+					Batch->SpanObj = SpanObj;
+					Batch->ShardIndex = SpanObj->BucketShardIndex;
 				}
 				else
 				{
-					flushSingleBlock(SpanObj, current);
-					spanHint = SpanObj;
-					current = next;
+					FlushSingleBlock(SpanObj, Current);
+					SpanHint = SpanObj;
+					Current = Next;
 					continue;
 				}
 			}
 
-			*reinterpret_cast<void**>(current) = batch->Head;
-			batch->Head = current;
-			if (!batch->Tail)
+			*reinterpret_cast<void**>(Current) = Batch->Head;
+			Batch->Head = Current;
+			if (!Batch->Tail)
 			{
-				batch->Tail = current;
+				Batch->Tail = Current;
 			}
-			++batch->Count;
-			spanHint = SpanObj;
+			++Batch->Count;
+			SpanHint = SpanObj;
 
-			current = next;
+			Current = Next;
 		}
 
-		for (std::size_t i = 0; i < batchCount; ++i)
+		for (std::size_t i = 0; i < BatchCount; ++i)
 		{
-			SpanBatch& batch = batches[i];
-			if (!batch.SpanObj || batch.Count == 0)
+			SpanBatch& Batch = Batches[i];
+			if (!Batch.SpanObj || Batch.Count == 0)
 			{
 				continue;
 			}
 
-			SizeClassBucketShard& Shard = Bucket.Shards[normalizeShardIndex(batch.ShardIndex)];
+			SizeClassBucketShard& Shard = Bucket.Shards[normalizeShardIndex(Batch.ShardIndex)];
 			std::lock_guard<SpinLock> Lock(Shard.Lock);
-			applyReturnedBatchLocked(Shard, *batch.SpanObj, batch.Head, batch.Tail, batch.Count);
+			applyReturnedBatchLocked(Shard, *Batch.SpanObj, Batch.Head, Batch.Tail, Batch.Count);
 			trimEmptySpansLocked(Shard);
 		}
 	}
 
 	/**
-	 * @brief Read immutable size-class metadata.
+	 * @brief Read immutable Size-class metadata.
 	 * @param
 	 *     - ClassIndex  std::uint16_t  Size-class index.
 	 * @usage
@@ -352,25 +370,56 @@ public:
 		return ClassIndex < NumSizeClasses ? Classes[ClassIndex] : SizeClass{};
 	}
 
+	[[nodiscard]] bool isCurrentThreadShardForPointer(
+		void* Ptr,
+		const std::uint16_t ExpectedSizeClass,
+		Span* Hint,
+		Span** OutResolvedSpan = nullptr) const
+	{
+		if (!Ptr || ExpectedSizeClass >= NumSizeClasses)
+		{
+			return true;
+		}
+
+		Span* SpanObj = findSpanHinted(Ptr, Hint, ExpectedSizeClass);
+		if (OutResolvedSpan)
+		{
+			*OutResolvedSpan = SpanObj;
+		}
+
+		if (!SpanObj)
+		{
+			return true;
+		}
+
+		const std::size_t CurrentShard = getThreadShardIndex();
+		const std::size_t OwnerShard = normalizeShardIndex(SpanObj->BucketShardIndex);
+		return CurrentShard == OwnerShard;
+	}
+
 	[[nodiscard]] PageToSpanPoolStats getPageToSpanPoolStats()
 	{
 		PageToSpanPoolStats stats;
 
+		for (std::size_t I = 0; I < CentralPoolPageMapShardCount; ++I)
 		{
-			std::lock_guard lock(SpanMapMutex);
-			stats.EntryCount = PageToSpan.size();
-			stats.Level1NodesUsed = PageToSpan.level1NodesUsed();
-			stats.Level1NodesCapacity = PageToSpan.level1NodesCapacity();
-			stats.Level2NodesUsed = PageToSpan.level2NodesUsed();
-			stats.Level2NodesCapacity = PageToSpan.level2NodesCapacity();
-			stats.PoolExhaustionWarningCount = PageToSpan.poolExhaustionFailureCount();
+			PageMapShard& Shard = PageToSpanShards[I];
+			std::lock_guard<SpinLock> Lock(Shard.Lock);
+			stats.EntryCount += Shard.Map.size();
+			stats.Level1NodesUsed += Shard.Map.level1NodesUsed();
+			stats.Level1NodesCapacity += Shard.Map.level1NodesCapacity();
+			stats.Level2NodesUsed += Shard.Map.level2NodesUsed();
+			stats.Level2NodesCapacity += Shard.Map.level2NodesCapacity();
+			stats.PoolExhaustionWarningCount += Shard.Map.poolExhaustionFailureCount();
 		}
 
 		{
 			std::lock_guard storageLock(SpanStorageMutex);
-			stats.SpanObjectsAllocated = SpanPoolAllocatedCount;
-			stats.SpanObjectsInUse = SpanPoolAllocatedCount >= SpanPoolFreeCount
-				? SpanPoolAllocatedCount - SpanPoolFreeCount
+			const std::size_t Allocated = SpanPoolAllocatedCount.load(std::memory_order_relaxed);
+			const std::size_t Free = SpanPoolFreeCount.load(std::memory_order_relaxed);
+			stats.SpanObjectsAllocated = Allocated;
+			stats.SpanObjectsInUse = Allocated >= Free
+				? Allocated - Free
 				: 0;
 		}
 
@@ -381,7 +430,7 @@ public:
 	}
 
 private:
-	static constexpr std::size_t SpanPoolChunkSize = 256;
+	static constexpr std::size_t SpanPoolChunkSize = tuning::CentralPoolSpanPoolChunkSize;
 
 	struct SizeClassBucketShard
 	{
@@ -393,18 +442,50 @@ private:
 
 	struct SizeClassBucket
 	{
-		std::array<SizeClassBucketShard, CentralPoolBucketShardCount> Shards{};
+		std::array<SizeClassBucketShard, CentralPoolBucketMaxShardCount> Shards{};
 	};
 
-	[[nodiscard]] static std::size_t getThreadShardIndex() noexcept
+	struct PageMapShard
 	{
-		const std::size_t hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
-		return hash % CentralPoolBucketShardCount;
+			mutable SpinLock Lock;
+		core::containers::RadixTreeMap<Span*, 12, 16, 10, 10, 64, 1024> Map;
+	};
+
+	[[nodiscard]] static std::size_t determineBucketShardCount() noexcept
+	{
+		const std::size_t Hardware = std::thread::hardware_concurrency();
+		const std::size_t Desired = Hardware == 0
+			? tuning::CentralPoolMinShardCount
+			: Hardware * tuning::CentralPoolShardScale;
+		return std::max<std::size_t>(
+			tuning::CentralPoolMinShardCount,
+			std::min<std::size_t>(Desired, CentralPoolBucketMaxShardCount));
 	}
 
-	[[nodiscard]] static std::size_t normalizeShardIndex(const std::uint16_t ShardIndex) noexcept
+	[[nodiscard]] std::size_t getThreadShardIndex() const noexcept
 	{
-		return static_cast<std::size_t>(ShardIndex) % CentralPoolBucketShardCount;
+		const std::size_t hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+		return hash % ActiveBucketShardCount;
+	}
+
+	[[nodiscard]] std::size_t normalizeShardIndex(const std::uint16_t ShardIndex) const noexcept
+	{
+		return static_cast<std::size_t>(ShardIndex) % ActiveBucketShardCount;
+	}
+
+	[[nodiscard]] static std::size_t pageMapShardIndex(const std::uint64_t PageBase) noexcept
+	{
+		return static_cast<std::size_t>((PageBase >> tuning::CentralPoolPageShift) % CentralPoolPageMapShardCount);
+	}
+
+	[[nodiscard]] PageMapShard& getPageMapShard(const std::uint64_t PageBase) noexcept
+	{
+		return PageToSpanShards[pageMapShardIndex(PageBase)];
+	}
+
+	[[nodiscard]] PageMapShard& getPageMapShard(const std::uint64_t PageBase) const noexcept
+	{
+		return const_cast<PageMapShard&>(PageToSpanShards[pageMapShardIndex(PageBase)]);
 	}
 
 	[[nodiscard]] static double toUsageRatio(const std::size_t used, const std::size_t capacity) noexcept
@@ -540,39 +621,72 @@ private:
 
 	[[nodiscard]] Span* acquireSpanObject(const std::uint16_t ClassIndex)
 	{
-		std::lock_guard storageLock(SpanStorageMutex);
-
-		Span*& ClassFreeList = SpanClassFreeLists[ClassIndex];
-		Span* span = nullptr;
-		if (ClassFreeList)
-		{
-			span = ClassFreeList;
-			ClassFreeList = span->PoolNext;
-		}
-		else
-		{
-			if (!SpanFreeList && !growSpanPoolLocked())
+		auto tryPopHead = [](std::atomic<Span*>& Head) -> Span* {
+			Span* OldHead = Head.load(std::memory_order_acquire);
+			while (OldHead)
 			{
-				return nullptr;
+				Span* NewHead = OldHead->PoolNext;
+				if (Head.compare_exchange_weak(
+					OldHead,
+					NewHead,
+					std::memory_order_acq_rel,
+					std::memory_order_acquire))
+				{
+					OldHead->PoolNext = nullptr;
+					return OldHead;
+				}
 			}
 
-			span = SpanFreeList;
-			SpanFreeList = span->PoolNext;
-		}
-
-		if (!span)
-		{
 			return nullptr;
-		}
+		};
 
-		span->PoolNext = nullptr;
-		if (SpanPoolFreeCount > 0)
+		if (ClassIndex < NumSizeClasses)
 		{
-			--SpanPoolFreeCount;
+			if (Span* ClassSpan = tryPopHead(SpanClassFreeLists[ClassIndex]))
+			{
+				SpanPoolFreeCount.fetch_sub(1, std::memory_order_relaxed);
+				*ClassSpan = {};
+				return ClassSpan;
+			}
 		}
 
-		*span = {};
-		return span;
+		if (Span* GenericSpan = tryPopHead(SpanFreeList))
+		{
+			SpanPoolFreeCount.fetch_sub(1, std::memory_order_relaxed);
+			*GenericSpan = {};
+			return GenericSpan;
+		}
+
+		{
+			std::lock_guard storageLock(SpanStorageMutex);
+			if (!SpanFreeList.load(std::memory_order_acquire) &&
+				(ClassIndex >= NumSizeClasses || !SpanClassFreeLists[ClassIndex].load(std::memory_order_acquire)))
+			{
+				if (!growSpanPoolLocked())
+				{
+					return nullptr;
+				}
+			}
+		}
+
+		if (ClassIndex < NumSizeClasses)
+		{
+			if (Span* ClassSpan = tryPopHead(SpanClassFreeLists[ClassIndex]))
+			{
+				SpanPoolFreeCount.fetch_sub(1, std::memory_order_relaxed);
+				*ClassSpan = {};
+				return ClassSpan;
+			}
+		}
+
+		if (Span* GenericSpan = tryPopHead(SpanFreeList))
+		{
+			SpanPoolFreeCount.fetch_sub(1, std::memory_order_relaxed);
+			*GenericSpan = {};
+			return GenericSpan;
+		}
+
+		return nullptr;
 	}
 
 	void releaseSpanObject(Span* InSpan)
@@ -581,23 +695,31 @@ private:
 		{
 			return;
 		}
-
-		std::lock_guard storageLock(SpanStorageMutex);
 		const std::uint16_t ClassIndex = InSpan->SizeClassIndex;
 		*InSpan = {};
 
+		auto pushHead = [](std::atomic<Span*>& Head, Span* Node) {
+			Span* OldHead = Head.load(std::memory_order_acquire);
+			do
+			{
+				Node->PoolNext = OldHead;
+			} while (!Head.compare_exchange_weak(
+				OldHead,
+				Node,
+				std::memory_order_release,
+				std::memory_order_acquire));
+		};
+
 		if (ClassIndex < NumSizeClasses)
 		{
-			InSpan->PoolNext = SpanClassFreeLists[ClassIndex];
-			SpanClassFreeLists[ClassIndex] = InSpan;
+			pushHead(SpanClassFreeLists[ClassIndex], InSpan);
 		}
 		else
 		{
-			InSpan->PoolNext = SpanFreeList;
-			SpanFreeList = InSpan;
+			pushHead(SpanFreeList, InSpan);
 		}
 
-		++SpanPoolFreeCount;
+		SpanPoolFreeCount.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	[[nodiscard]] bool growSpanPoolLocked()
@@ -609,16 +731,35 @@ private:
 		}
 
 		Span* chunkBase = NewChunk.get();
+		Span* LocalHead = nullptr;
+		Span* LocalTail = nullptr;
 		for (std::size_t i = 0; i < SpanPoolChunkSize; ++i)
 		{
 			chunkBase[i] = {};
-			chunkBase[i].PoolNext = SpanFreeList;
-			SpanFreeList = &chunkBase[i];
+			chunkBase[i].PoolNext = LocalHead;
+			LocalHead = &chunkBase[i];
+			if (!LocalTail)
+			{
+				LocalTail = &chunkBase[i];
+			}
 		}
 
+		Span* OldHead = SpanFreeList.load(std::memory_order_acquire);
+		do
+		{
+			if (LocalTail)
+			{
+				LocalTail->PoolNext = OldHead;
+			}
+		} while (!SpanFreeList.compare_exchange_weak(
+			OldHead,
+			LocalHead,
+			std::memory_order_release,
+			std::memory_order_acquire));
+
 		SpanPoolChunks.push_back(std::move(NewChunk));
-		SpanPoolAllocatedCount += SpanPoolChunkSize;
-		SpanPoolFreeCount += SpanPoolChunkSize;
+		SpanPoolAllocatedCount.fetch_add(SpanPoolChunkSize, std::memory_order_relaxed);
+		SpanPoolFreeCount.fetch_add(SpanPoolChunkSize, std::memory_order_relaxed);
 		return true;
 	}
 
@@ -629,28 +770,32 @@ private:
 			return false;
 		}
 
-		std::lock_guard Lock(SpanMapMutex);
-		auto CurrentSnapshot = SpanLookupSnapshotState.load(std::memory_order_acquire);
-		auto NextSnapshot = std::make_shared<SpanLookupSnapshot>(
-			CurrentSnapshot ? *CurrentSnapshot : SpanLookupSnapshot{});
-
 		const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(InSpan.SpanBase);
+		std::vector<std::uint64_t> insertedPageBases;
+		insertedPageBases.reserve(InSpan.BackingSpan.PageCount);
 		for (std::size_t i = 0; i < InSpan.BackingSpan.PageCount; ++i)
 		{
 			const std::uint64_t pageBase = static_cast<std::uint64_t>(base + i * PageSize);
-			if (!PageToSpan.insertOrAssign(pageBase, &InSpan))
+			bool Inserted = false;
 			{
-				for (std::size_t rollback = 0; rollback < i; ++rollback)
+				PageMapShard& Shard = getPageMapShard(pageBase);
+				std::lock_guard<SpinLock> Lock(Shard.Lock);
+				Inserted = Shard.Map.insertOrAssign(pageBase, &InSpan);
+			}
+
+			if (!Inserted)
+			{
+				for (const std::uint64_t insertedPageBase : insertedPageBases)
 				{
-					PageToSpan.erase(static_cast<std::uint64_t>(base + rollback * PageSize));
+					PageMapShard& rollbackShard = getPageMapShard(insertedPageBase);
+					std::lock_guard<SpinLock> rollbackLock(rollbackShard.Lock);
+					rollbackShard.Map.erase(insertedPageBase);
 				}
 				return false;
 			}
 
-			(*NextSnapshot)[pageBase] = &InSpan;
+			insertedPageBases.push_back(pageBase);
 		}
-
-		SpanLookupSnapshotState.store(NextSnapshot, std::memory_order_release);
 
 		return true;
 	}
@@ -662,40 +807,23 @@ private:
 			return;
 		}
 
-		std::lock_guard Lock(SpanMapMutex);
-		auto CurrentSnapshot = SpanLookupSnapshotState.load(std::memory_order_acquire);
-		auto NextSnapshot = std::make_shared<SpanLookupSnapshot>(
-			CurrentSnapshot ? *CurrentSnapshot : SpanLookupSnapshot{});
-
 		const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(InSpan.SpanBase);
 		for (std::size_t i = 0; i < InSpan.BackingSpan.PageCount; ++i)
 		{
 			const std::uint64_t pageBase = static_cast<std::uint64_t>(base + i * PageSize);
-			PageToSpan.erase(pageBase);
-			NextSnapshot->erase(pageBase);
+			PageMapShard& Shard = getPageMapShard(pageBase);
+			std::lock_guard<SpinLock> Lock(Shard.Lock);
+			Shard.Map.erase(pageBase);
 		}
-
-		SpanLookupSnapshotState.store(NextSnapshot, std::memory_order_release);
 	}
 
 	[[nodiscard]] Span* findSpanSnapshot(void* Ptr) const
 	{
 		const std::uintptr_t Address = reinterpret_cast<std::uintptr_t>(Ptr);
 		const std::uint64_t PageBase = static_cast<std::uint64_t>(Address & ~(PageSize - 1));
-
-		auto Snapshot = SpanLookupSnapshotState.load(std::memory_order_acquire);
-		if (!Snapshot)
-		{
-			return nullptr;
-		}
-
-		auto Iter = Snapshot->find(PageBase);
-		if (Iter == Snapshot->end())
-		{
-			return nullptr;
-		}
-
-		return Iter->second;
+		PageMapShard& Shard = getPageMapShard(PageBase);
+		std::lock_guard<SpinLock> Lock(Shard.Lock);
+		return Shard.Map.find(PageBase);
 	}
 
 	[[nodiscard]] static bool isBlockInSpan(const Span& InSpan, const void* Ptr) noexcept
@@ -834,22 +962,18 @@ private:
 
 	PageAllocator* PageAllocator = nullptr;
 	std::size_t PageSize = 0;
+	std::size_t ActiveBucketShardCount = 8;
 
 	std::array<SizeClass, NumSizeClasses> Classes{};
 	std::array<SizeClassBucket, NumSizeClasses> Buckets{};
-
-	using SpanLookupSnapshot = std::unordered_map<std::uint64_t, Span*>;
-
-	mutable std::mutex SpanMapMutex;
-	core::containers::RadixTreeMap<Span*, 12, 16, 10, 10, 256, 4096> PageToSpan;
-	std::atomic<std::shared_ptr<const SpanLookupSnapshot>> SpanLookupSnapshotState;
+	std::array<PageMapShard, CentralPoolPageMapShardCount> PageToSpanShards{};
 
 	std::mutex SpanStorageMutex;
-	Span* SpanFreeList = nullptr;
-	std::array<Span*, NumSizeClasses> SpanClassFreeLists{};
+	std::atomic<Span*> SpanFreeList = nullptr;
+	std::array<std::atomic<Span*>, NumSizeClasses> SpanClassFreeLists{};
 	std::vector<std::unique_ptr<Span[]>> SpanPoolChunks;
-	std::size_t SpanPoolAllocatedCount = 0;
-	std::size_t SpanPoolFreeCount = 0;
+	std::atomic<std::size_t> SpanPoolAllocatedCount = 0;
+	std::atomic<std::size_t> SpanPoolFreeCount = 0;
 };
 
 } // namespace core::mem

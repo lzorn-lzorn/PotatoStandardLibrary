@@ -611,7 +611,12 @@ public:
                 const std::size_t spanBytes = Span.getBytes();
                 if (offset <= owner->Region.ReservedSize && spanBytes <= owner->Region.ReservedSize - offset)
                 {
-                    VirtualMemoryManager::decommit(owner->Region, offset, spanBytes);
+                    const bool largeSpan = spanBytes >= decommitThresholdBytes();
+                    const bool sampled = (shard.DecommitCounter++ & DecommitSampleMask) == 0;
+                    if (largeSpan || sampled)
+                    {
+                        VirtualMemoryManager::decommit(owner->Region, offset, spanBytes);
+                    }
                 }
             }
         }
@@ -620,8 +625,8 @@ public:
     }
 
 private:
-    static constexpr std::size_t MaxCachedPageCount = 65535;
-    static constexpr std::size_t MaxShardCount = 16;
+    static constexpr std::size_t MaxShardCount = tuning::PageAllocatorMaxShardCount;
+    static constexpr std::uint32_t DecommitSampleMask = tuning::PageAllocatorDecommitSampleMask;
 
     [[nodiscard]] static double toUsageRatio(const std::size_t used, const std::size_t capacity) noexcept
     {
@@ -643,19 +648,53 @@ private:
 
     struct Shard
     {
-        std::mutex Mutex;
+        SpinLock Mutex;
         std::deque<RegionCursor> Regions;
         core::containers::RadixTreeMap<RegionCursor*, 0, 16, 10, 10, 32, 512> RegionIndex;
-        std::array<std::vector<PageSpan>, MaxCachedPageCount + 1> FreeSpanCache{};
+        std::array<std::vector<PageSpan>, tuning::PageAllocatorCacheBucketCount> FreeSpanCache;
         std::vector<PageSpan> OversizedFreeSpanCache;
         std::uint64_t NextRegionId = 1;
+        std::uint32_t DecommitCounter = 0;
     };
 
     [[nodiscard]] static std::size_t determineShardCount() noexcept
     {
         const std::size_t hardware = std::thread::hardware_concurrency();
-        const std::size_t desired = hardware == 0 ? 8u : hardware;
+        const std::size_t desired = hardware == 0
+            ? tuning::PageAllocatorMinShardCount
+            : hardware * tuning::PageAllocatorShardScale;
         return std::max<std::size_t>(1, std::min<std::size_t>(desired, MaxShardCount));
+    }
+
+    [[nodiscard]] static std::size_t getCacheBucket(const std::size_t PageCount) noexcept
+    {
+        if (PageCount == 0)
+        {
+            return 0;
+        }
+
+        if (PageCount <= 4)
+        {
+            return PageCount - 1;
+        }
+
+        if (PageCount <= 16)
+        {
+            return 4 + (PageCount / 2);
+        }
+
+        const std::size_t FloorLog2 = std::bit_width(PageCount) - 1;
+        return std::min<std::size_t>(
+            tuning::PageAllocatorCacheBucketCount - 1,
+            12 + FloorLog2);
+    }
+
+    [[nodiscard]] std::size_t decommitThresholdBytes() const noexcept
+    {
+        const std::size_t dynamicThreshold = std::max<std::size_t>(
+            tuning::PageAllocatorDecommitMinBytes,
+            Config.SmallRegionReserveBytes / tuning::PageAllocatorDecommitRegionDivisor);
+        return std::max<std::size_t>(dynamicThreshold, PageSize * tuning::PageAllocatorDecommitMinPages);
     }
 
     [[nodiscard]] std::size_t selectShardIndex() const noexcept
@@ -686,15 +725,17 @@ private:
 
     [[nodiscard]] bool tryPopCachedSpanLocked(Shard& ShardState, const std::size_t PageCount, PageSpan& OutSpan)
     {
-        if (PageCount <= MaxCachedPageCount)
+        std::vector<PageSpan>& bucket = ShardState.FreeSpanCache[getCacheBucket(PageCount)];
+        for (std::size_t i = bucket.size(); i > 0; --i)
         {
-            std::vector<PageSpan>& bucket = ShardState.FreeSpanCache[PageCount];
-            if (bucket.empty())
+            PageSpan& candidate = bucket[i - 1];
+            if (candidate.PageCount != PageCount)
             {
-                return false;
+                continue;
             }
 
-            OutSpan = bucket.back();
+            OutSpan = candidate;
+            bucket[i - 1] = bucket.back();
             bucket.pop_back();
             return true;
         }
@@ -717,9 +758,9 @@ private:
 
     void pushCachedSpanLocked(Shard& ShardState, const PageSpan& Span)
     {
-        if (Span.PageCount <= MaxCachedPageCount)
+        if (Span.PageCount <= tuning::PageAllocatorCachedMaxPageCount)
         {
-            ShardState.FreeSpanCache[Span.PageCount].push_back(Span);
+            ShardState.FreeSpanCache[getCacheBucket(Span.PageCount)].push_back(Span);
             return;
         }
 

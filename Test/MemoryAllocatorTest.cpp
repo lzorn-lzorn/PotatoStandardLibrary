@@ -432,7 +432,6 @@ void TestNoThrowAllocationBehavior(TestContext& context)
 		alignof(std::max_align_t),
 		0,
 		false,
-		core::mem::AllocationLifetime::Default,
 		true);
 	context.Expect(ptr == nullptr, "allocate with IsNoThrow should return nullptr on allocation failure");
 
