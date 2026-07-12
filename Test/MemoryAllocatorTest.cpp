@@ -6,12 +6,16 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <memory_resource>
+#include <new>
 #include <numeric>
 #include <print>
 #include <thread>
 #include <vector>
 
+#include "../Core/Containers/radix_tree.h"
 #include <Core/Memory/memory_facade.h>
 #include <Core/Memory/Observability/memory_observability.h>
 
@@ -214,6 +218,35 @@ void TestUseAfterFreeDetection(TestContext& context)
 #endif
 }
 
+void TestQuarantineDoesNotDrainOnAllocate(TestContext& context)
+{
+#if !defined(NDEBUG) || defined(CORE_MEM_FORCE_DEBUG)
+	UseAfterFreeObserver observer;
+	core::mem::AllocatorFacade::bindObserver(observer);
+
+	constexpr std::size_t size = 96;
+	void* ptr = core::mem::AllocatorFacade::allocateTransient(size, alignof(std::max_align_t));
+	core::mem::AllocatorFacade::deallocateTransient(ptr, size, alignof(std::max_align_t));
+	std::memset(ptr, 0xAB, size);
+
+	void* probe = core::mem::AllocatorFacade::allocateTransient(64, alignof(std::max_align_t));
+	core::mem::AllocatorFacade::deallocateTransient(probe, 64, alignof(std::max_align_t));
+
+	context.Expect(
+		observer.Count.load(std::memory_order_relaxed) == 0,
+		"quarantine should not be drained implicitly by allocation hot path");
+
+	core::mem::AllocatorFacade::flushDeferredFrees();
+	context.Expect(
+		observer.Count.load(std::memory_order_relaxed) > 0,
+		"quarantine should report use-after-free when explicitly flushed");
+
+	core::mem::AllocatorFacade::unbindObserver(observer);
+#else
+	context.Expect(true, "deterministic quarantine test skipped in release mode");
+#endif
+}
+
 void TestPrewarmApi(TestContext& context)
 {
 	std::vector<core::mem::MemoryPrewarmRequest> requests;
@@ -222,6 +255,189 @@ void TestPrewarmApi(TestContext& context)
 
 	const std::size_t warmed = core::mem::AllocatorFacade::prewarm(requests);
 	context.Expect(warmed == 640, "prewarm API should execute full batch warm-up requests");
+}
+
+void TestAllocatorStatsApi(TestContext& context)
+{
+	constexpr std::size_t size = 128;
+	void* ptr = core::mem::AllocatorFacade::allocateTransient(size, alignof(std::max_align_t), 88);
+	core::mem::AllocatorFacade::deallocateTransient(ptr, size, alignof(std::max_align_t), 88);
+
+	auto before_flush = core::mem::AllocatorFacade::getStats();
+	core::mem::AllocatorFacade::flushDeferredFrees();
+	auto after_flush = core::mem::AllocatorFacade::getStats();
+
+	if constexpr (core::mem::MemoryDebugEnabled)
+	{
+		context.Expect(
+			before_flush.QuarantineEntryCount >= 1,
+			"stats API should expose quarantine entries before flush in debug path");
+	}
+
+	context.Expect(
+		after_flush.QuarantineEntryCount == 0,
+		"stats API should report zero quarantine entries after flush");
+
+	context.Expect(
+		after_flush.PageToSpanLevel1NodesUsed <= after_flush.PageToSpanLevel1NodesCapacity,
+		"PageToSpan L1 usage should not exceed capacity");
+	context.Expect(
+		after_flush.PageToSpanLevel2NodesUsed <= after_flush.PageToSpanLevel2NodesCapacity,
+		"PageToSpan L2 usage should not exceed capacity");
+	context.Expect(
+		after_flush.PageToSpanLevel1UsageRatio >= 0.0 && after_flush.PageToSpanLevel1UsageRatio <= 1.0,
+		"PageToSpan L1 usage ratio should stay within [0, 1]");
+	context.Expect(
+		after_flush.PageToSpanLevel2UsageRatio >= 0.0 && after_flush.PageToSpanLevel2UsageRatio <= 1.0,
+		"PageToSpan L2 usage ratio should stay within [0, 1]");
+
+	context.Expect(
+		after_flush.RegionIndexLevel1NodesUsed <= after_flush.RegionIndexLevel1NodesCapacity,
+		"RegionIndex L1 usage should not exceed capacity");
+	context.Expect(
+		after_flush.RegionIndexLevel2NodesUsed <= after_flush.RegionIndexLevel2NodesCapacity,
+		"RegionIndex L2 usage should not exceed capacity");
+	context.Expect(
+		after_flush.RegionIndexLevel1UsageRatio >= 0.0 && after_flush.RegionIndexLevel1UsageRatio <= 1.0,
+		"RegionIndex L1 usage ratio should stay within [0, 1]");
+	context.Expect(
+		after_flush.RegionIndexLevel2UsageRatio >= 0.0 && after_flush.RegionIndexLevel2UsageRatio <= 1.0,
+		"RegionIndex L2 usage ratio should stay within [0, 1]");
+
+	context.Expect(
+		after_flush.SpanObjectPoolInUse <= after_flush.SpanObjectPoolAllocated,
+		"span object pool in-use count should not exceed allocated count");
+	context.Expect(
+		after_flush.SpanObjectPoolUsageRatio >= 0.0 && after_flush.SpanObjectPoolUsageRatio <= 1.0,
+		"span object pool usage ratio should stay within [0, 1]");
+}
+
+void TestPageAllocatorSpanCacheReuseSafety(TestContext& context)
+{
+	core::mem::AllocatorConfig local_config;
+	local_config.SmallRegionReserveBytes = 128u * 1024u;
+	auto page_allocator = std::make_unique<core::mem::PageAllocator>(local_config);
+
+	core::mem::PageSpan cached = page_allocator->acquireSpan(2);
+	context.Expect(cached.isValid(), "page allocator should provide initial span");
+	if (!cached.isValid())
+	{
+		return;
+	}
+
+	const std::byte* cached_base = cached.Base;
+	page_allocator->releaseSpan(cached);
+
+	std::vector<core::mem::PageSpan> inflight;
+	inflight.reserve(256);
+	for (int i = 0; i < 128; ++i)
+	{
+		core::mem::PageSpan span = page_allocator->acquireSpan(32);
+		if (!span.isValid())
+		{
+			break;
+		}
+		inflight.push_back(span);
+	}
+
+	core::mem::PageSpan reused = page_allocator->acquireSpan(2);
+	context.Expect(reused.isValid(), "cached span should remain reusable after region growth");
+	if (reused.isValid())
+	{
+		context.Expect(reused.Base == cached_base, "cached span should preserve original base address");
+		page_allocator->releaseSpan(reused);
+	}
+
+	for (const core::mem::PageSpan& span : inflight)
+	{
+		page_allocator->releaseSpan(span);
+	}
+}
+
+void TestRadixTreeMap(TestContext& context)
+{
+	static core::containers::RadixTreeMap<void*, 12, 16, 10, 10, 32, 256> page_map;
+	page_map.clear();
+	int value_a = 1;
+	int value_b = 2;
+
+	constexpr std::uint64_t key_a = 0x000012340000ull;
+	constexpr std::uint64_t key_b = 0x000056780000ull;
+
+	context.Expect(page_map.empty(), "radix tree should start empty");
+	context.Expect(page_map.insertOrAssign(key_a, &value_a), "radix tree insert should succeed");
+	context.Expect(page_map.insertOrAssign(key_b, &value_b), "radix tree second insert should succeed");
+
+	context.Expect(page_map.find(key_a) == &value_a, "radix tree should find first key");
+	context.Expect(page_map.find(key_b) == &value_b, "radix tree should find second key");
+	context.Expect(page_map.size() == 2, "radix tree size should track inserted entries");
+
+	context.Expect(page_map.insertOrAssign(key_a, &value_b), "radix tree assign should succeed");
+	context.Expect(page_map.find(key_a) == &value_b, "radix tree assign should replace existing value");
+
+	context.Expect(page_map.erase(key_b), "radix tree erase should remove existing key");
+	context.Expect(page_map.find(key_b) == nullptr, "radix tree erase should clear value");
+	context.Expect(page_map.size() == 1, "radix tree size should shrink after erase");
+
+	constexpr std::uint64_t unsupported_key = (std::uint64_t{1} << 48);
+	context.Expect(!page_map.insertOrAssign(unsupported_key, &value_a), "radix tree should reject out-of-range key");
+	context.Expect(page_map.find(unsupported_key) == nullptr, "radix tree should return null for out-of-range key");
+
+	page_map.clear();
+	context.Expect(page_map.empty(), "radix tree clear should remove all entries");
+}
+
+void TestNoThrowAllocationBehavior(TestContext& context)
+{
+	const std::size_t impossible_size = std::numeric_limits<std::size_t>::max() / 2;
+
+	bool threw_bad_alloc = false;
+	try
+	{
+		(void)core::mem::AllocatorFacade::allocate(impossible_size, alignof(std::max_align_t));
+	}
+	catch (const std::bad_alloc&)
+	{
+		threw_bad_alloc = true;
+	}
+	catch (...)
+	{
+		context.Expect(false, "throwing allocation should only throw std::bad_alloc");
+	}
+
+	context.Expect(threw_bad_alloc, "default allocate should throw std::bad_alloc on allocation failure");
+
+	void* ptr = core::mem::AllocatorFacade::allocate(
+		impossible_size,
+		alignof(std::max_align_t),
+		0,
+		false,
+		core::mem::AllocationLifetime::Default,
+		true);
+	context.Expect(ptr == nullptr, "allocate with IsNoThrow should return nullptr on allocation failure");
+
+	void* ptr_no_throw = core::mem::AllocatorFacade::allocateNoThrow(impossible_size, alignof(std::max_align_t));
+	context.Expect(ptr_no_throw == nullptr, "allocateNoThrow should return nullptr on allocation failure");
+}
+
+void TestZeroSizeAllocationBehavior(TestContext& context)
+{
+	void* ptr = core::mem::AllocatorFacade::allocate(0, alignof(std::max_align_t));
+	void* ptr_no_throw = core::mem::AllocatorFacade::allocateNoThrow(0, alignof(std::max_align_t));
+
+	context.Expect(ptr != nullptr, "zero-size allocate should return a non-null sentinel pointer");
+	context.Expect(ptr_no_throw != nullptr, "zero-size allocateNoThrow should return a non-null sentinel pointer");
+	context.Expect(ptr == ptr_no_throw, "zero-size allocations should use a stable sentinel pointer");
+
+	core::mem::AllocatorFacade::deallocate(ptr, 0, alignof(std::max_align_t));
+	core::mem::AllocatorFacade::deallocate(ptr_no_throw, 0, alignof(std::max_align_t));
+
+	void* normal_ptr = core::mem::AllocatorFacade::allocate(64, alignof(std::max_align_t));
+	context.Expect(normal_ptr != nullptr, "regular allocation should continue to work after zero-size operations");
+	if (normal_ptr)
+	{
+		core::mem::AllocatorFacade::deallocate(normal_ptr, 64, alignof(std::max_align_t));
+	}
 }
 
 void TestHookIssueTracking(TestContext& context)
@@ -367,7 +583,6 @@ int main()
 	TestContext context;
 	core::mem::MemoryTracker::setHookEnabled(false);
 	core::mem::AllocatorConfig config;
-	config.CaptureStack = false;
 	core::mem::AllocatorFacade::configure(config);
 	TestSmallAllocationRoundTrip(context);
 	TestConcurrentAllocation(context);
@@ -377,7 +592,13 @@ int main()
 	TestDebugGuardDetection(context);
 	TestDeallocateNullptr(context);
 	TestUseAfterFreeDetection(context);
+	TestQuarantineDoesNotDrainOnAllocate(context);
 	TestPrewarmApi(context);
+	TestAllocatorStatsApi(context);
+	TestPageAllocatorSpanCacheReuseSafety(context);
+	TestRadixTreeMap(context);
+	TestNoThrowAllocationBehavior(context);
+	TestZeroSizeAllocationBehavior(context);
 	TestHookIssueTracking(context);
 	BenchmarkLargeAllocation(context);
 	BenchmarkHighFrequencyAllocation(context);

@@ -12,8 +12,24 @@ add_compile_options(
 )
 
 option(POTATO_STANDARD_BUILD_TESTS "Build tests under Test/." ${PROJECT_IS_TOP_LEVEL})
+option(POTATO_STANDARD_BUILD_BENCHMARKS "Build benchmarks under Benchmark/." ${PROJECT_IS_TOP_LEVEL})
 
 add_subdirectory(Core)
+
+if(POTATO_STANDARD_BUILD_BENCHMARKS)
+	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/CMakeLists.txt" AND
+		EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/PerfBench/CMakeLists.txt")
+		set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+		set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+		set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+		set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+
+		add_subdirectory(benchmark EXCLUDE_FROM_ALL)
+		add_subdirectory(PerfBench)
+	else()
+		message(WARNING "Benchmark sources are incomplete. Skip benchmark targets.")
+	endif()
+endif()
 
 if(POTATO_STANDARD_BUILD_TESTS)
 	include(CTest)

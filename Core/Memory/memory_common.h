@@ -14,6 +14,10 @@
 #include <thread>
 #include <vector>
 
+#if (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__))
+#include <immintrin.h>
+#endif
+
 namespace core::mem
 {
 
@@ -23,6 +27,39 @@ inline constexpr bool MemoryDebugEnabled =
 #else
 	true;
 #endif
+
+#if defined(NDEBUG) && !defined(CORE_MEM_FORCE_DEBUG)
+#define CORE_MEM_DEFAULT_DEBUG_FEATURES 0
+#else
+#define CORE_MEM_DEFAULT_DEBUG_FEATURES 1
+#endif
+
+#ifndef CORE_MEM_CFG_ENABLE_DEBUG_GUARDS
+#define CORE_MEM_CFG_ENABLE_DEBUG_GUARDS CORE_MEM_DEFAULT_DEBUG_FEATURES
+#endif
+
+#ifndef CORE_MEM_CFG_ENABLE_UAF_DETECTION
+#define CORE_MEM_CFG_ENABLE_UAF_DETECTION CORE_MEM_DEFAULT_DEBUG_FEATURES
+#endif
+
+#ifndef CORE_MEM_CFG_CAPTURE_STACK
+#define CORE_MEM_CFG_CAPTURE_STACK 0
+#endif
+
+#ifndef CORE_MEM_CFG_QUARANTINE_RELEASE_ONLY_ON_FLUSH
+#define CORE_MEM_CFG_QUARANTINE_RELEASE_ONLY_ON_FLUSH 1
+#endif
+
+#ifndef CORE_MEM_CFG_LAZY_COMMIT
+#define CORE_MEM_CFG_LAZY_COMMIT 1
+#endif
+
+inline constexpr bool MemoryCompileEnableDebugGuards = CORE_MEM_CFG_ENABLE_DEBUG_GUARDS != 0;
+inline constexpr bool MemoryCompileEnableUseAfterFreeDetection = CORE_MEM_CFG_ENABLE_UAF_DETECTION != 0;
+inline constexpr bool MemoryCompileCaptureStack = CORE_MEM_CFG_CAPTURE_STACK != 0;
+inline constexpr bool MemoryCompileQuarantineReleaseOnlyOnFlush =
+	CORE_MEM_CFG_QUARANTINE_RELEASE_ONLY_ON_FLUSH != 0;
+inline constexpr bool MemoryCompileLazyCommit = CORE_MEM_CFG_LAZY_COMMIT != 0;
 
 inline constexpr std::uint8_t AllocatedPattern = 0xCD;
 inline constexpr std::uint8_t FreedPattern = 0xDD;
@@ -47,6 +84,34 @@ inline constexpr std::uint16_t InvalidSizeClass = std::numeric_limits<std::uint1
 	return static_cast<std::uint64_t>(
 		std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count());
 }
+
+inline void spinPause() noexcept
+{
+#if (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__))
+	_mm_pause();
+#else
+	std::this_thread::yield();
+#endif
+}
+
+struct SpinLock
+{
+	void lock() noexcept
+	{
+		while (Locked.test_and_set(std::memory_order_acquire))
+		{
+			spinPause();
+		}
+	}
+
+	void unlock() noexcept
+	{
+		Locked.clear(std::memory_order_release);
+	}
+
+private:
+	std::atomic_flag Locked = ATOMIC_FLAG_INIT;
+};
 
 enum class AllocationStage : std::uint16_t
 {
@@ -284,19 +349,15 @@ private:
 
 struct AllocatorConfig
 {
-	std::size_t ThreadCacheMaxBytes = 2u * 1024u * 1024u;
-	std::uint16_t ThreadCacheMaxPerClass = 256;
-	std::uint16_t RefillBatchSize = 32;
+	std::size_t ThreadCacheMaxBytes = 16u * 1024u * 1024u;
+	std::uint16_t ThreadCacheMaxPerClass = 1024;
+	std::uint16_t RefillBatchSize = 64;
 	std::size_t SmallRegionReserveBytes = 64u * 1024u * 1024u;
 	std::size_t DedicatedRegionReserveBytes = 2u * 1024u * 1024u;
 	bool EnableHugePage = false;
 	bool EnableDedicatedRegionCache = true;
 	std::size_t DedicatedRegionCacheLimitBytes = 128u * 1024u * 1024u;
 	std::size_t DedicatedRegionCacheMaxEntriesPerSize = 8;
-	bool LazyCommit = true;
-	bool CaptureStack = false;
-	bool EnableDebugGuards = MemoryDebugEnabled;
-	bool EnableUseAfterFreeDetection = MemoryDebugEnabled;
 	std::size_t UseAfterFreeQuarantineBytes = 512u * 1024u;
 	std::size_t UseAfterFreeQuarantineMaxEntries = 8192;
 	std::int32_t PreferredNumaNode = -1;

@@ -108,9 +108,41 @@ User API (AllocatorFacade / EngineAllocator / EngineMemoryResource)
 ## 6. 并发模型
 
 - ThreadCache：线程私有，无共享锁
-- CentralPool：按 size class 分桶锁，减少全局竞争
-- Span 页映射：共享读写锁保护
+- CentralPool：按 size class + shard 分桶，热点路径使用自旋锁
+- PageAllocator：按线程哈希分片（Shard），每个分片独立维护 Region/FreeSpanCache 与互斥锁
+- Span 页映射：写路径使用互斥锁 + 快照发布；读路径通过 RCU 风格快照无锁查询
 - EventBus：快照发布模型，读路径无写锁放大
+
+### 6.1 PageAllocator Sharding
+
+- `acquireSpan/releaseSpan` 不再竞争单一全局锁，而是先选择一个 shard。
+- shard 内部独立维护：
+  - `Regions`
+  - `RegionIndex`
+  - `FreeSpanCache`
+  - `OversizedFreeSpanCache`
+- 释放时通过 `OwnerRegionId` 回到原 shard，保证 span 生命周期一致性。
+
+### 6.2 CentralPool PageToSpan 读无锁快照
+
+- 注册/反注册 span 页映射时：
+  - 在写锁下更新内部 `PageToSpan`
+  - 同步构建并发布新的只读快照
+- `returnBatch` 热路径：
+  - 不再持有 `SpanMapMutex` 读锁
+  - 直接从原子快照读取页到 span 的映射
+- span 对象空闲池按 size class 分桶，避免跨 class 复用造成并发误判。
+
+### 6.3 CentralPool Per-SizeClass Sharding
+
+- 每个 size class 内部再划分多个 shard（固定数量），根据线程 ID 哈希定位 shard。
+- `fetchBatch` 在当前线程 shard 内取/建 span，减少同一 size class 的锁碰撞。
+- `returnBatch` 先按 span 分组，再回到各自 shard 合并 freelist，避免单锁串行化。
+
+### 6.4 热路径分配优化
+
+- `returnBatch` 使用固定大小分组数组（默认 8 组）代替每次 `std::vector` 动态分配。
+- 当分组超过固定容量时，退化为单块即时归还，保持无堆分配热路径。
 
 ## 7. Debug 与 Release 策略
 
@@ -198,3 +230,82 @@ User API (AllocatorFacade / EngineAllocator / EngineMemoryResource)
 - 修改 CentralPool 结构时，先验证 span 状态转移与回收边界
 - 修改 ThreadCache 策略时，保持 fast path 常量时间
 - 任何新观测逻辑优先通过 EventBus 接入，避免耦合到分配核心
+
+## 15. 编译期策略开关（Memory 子模块）
+
+- 新增 `Core/Memory/CMakeLists.txt` 作为 Memory 子模块配置入口。
+- `Core/CMakelists.txt` 会加载该模块并把开关转换成编译期宏。
+
+当前支持：
+
+- `POTATO_MEMORY_DEBUG_GUARDS_MODE`：`AUTO|ON|OFF`
+- `POTATO_MEMORY_UAF_DETECTION_MODE`：`AUTO|ON|OFF`
+- `POTATO_MEMORY_CAPTURE_STACK`：`ON|OFF`
+- `POTATO_MEMORY_QUARANTINE_RELEASE_ONLY_ON_FLUSH`：`ON|OFF`
+- `POTATO_MEMORY_LAZY_COMMIT`：`ON|OFF`
+
+对应宏：
+
+- `CORE_MEM_CFG_ENABLE_DEBUG_GUARDS`
+- `CORE_MEM_CFG_ENABLE_UAF_DETECTION`
+- `CORE_MEM_CFG_CAPTURE_STACK`
+- `CORE_MEM_CFG_QUARANTINE_RELEASE_ONLY_ON_FLUSH`
+- `CORE_MEM_CFG_LAZY_COMMIT`
+
+在代码中统一映射为 `memory_common.h` 中的 `MemoryCompile*` 常量，分配器热点路径通过 `if constexpr` 进行编译期裁剪。
+
+## 16. 测试与 Benchmark 构建（Debug / Release）
+
+以下命令均在仓库根目录执行。
+
+### 16.1 一次性配置
+
+```powershell
+cmake -S . -B build -DPOTATO_STANDARD_BUILD_TESTS=ON -DPOTATO_STANDARD_BUILD_BENCHMARKS=ON
+```
+
+### 16.2 构建并运行测试
+
+Debug：
+
+```powershell
+cmake --build build --config Debug --target MemoryAllocatorTest_cpp
+ctest --test-dir build -C Debug -R MemoryAllocatorTest_cpp --output-on-failure
+```
+
+Release：
+
+```powershell
+cmake --build build --config Release --target MemoryAllocatorTest_cpp
+ctest --test-dir build -C Release -R MemoryAllocatorTest_cpp --output-on-failure
+```
+
+### 16.3 构建并运行 Benchmark
+
+Debug：
+
+```powershell
+cmake --build build --config Debug --target MemoryAllocatorBenchmark
+.\build\PerfBench\Debug\MemoryAllocatorBenchmark.exe
+```
+
+Release：
+
+```powershell
+cmake --build build --config Release --target MemoryAllocatorBenchmark
+.\build\PerfBench\Release\MemoryAllocatorBenchmark.exe
+```
+
+### 16.4 常用 Benchmark 参数
+
+仅跑多线程 64B 场景：
+
+```powershell
+.\build\PerfBench\Release\MemoryAllocatorBenchmark.exe --benchmark_filter="BM_TransientAllocateFreeThreaded64" --benchmark_min_time=1.0s
+```
+
+导出 JSON 结果：
+
+```powershell
+.\build\PerfBench\Release\MemoryAllocatorBenchmark.exe --benchmark_out=build\benchmark_result.json --benchmark_out_format=json
+```

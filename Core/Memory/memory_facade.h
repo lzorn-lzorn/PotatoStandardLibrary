@@ -12,6 +12,11 @@
 #include <unordered_map>
 #include <vector>
 
+#if !defined(_WIN32) && (defined(__linux__) || defined(__APPLE__))
+#include <execinfo.h>
+#endif
+
+#include "Observability/memory_statistics.h"
 #include "thread_cache.h"
 
 namespace core::mem
@@ -20,6 +25,8 @@ namespace core::mem
 class MemoryAllocatorEngine
 {
 public:
+	using RuntimeStats = AllocatorRuntimeStatsSnapshot;
+
 	explicit MemoryAllocatorEngine(const AllocatorConfig& InConfig)
 		: Config(InConfig)
 		, PageAllocator(Config)
@@ -50,7 +57,10 @@ public:
 
 	[[nodiscard]] void* allocate(const AllocationDescriptor& Descriptor)
 	{
-		drainQuarantineToBudget();
+		if (Descriptor.Size == 0)
+		{
+			return getZeroSizeAllocationPointer();
+		}
 
 		AllocationContext Context;
 		Context.Descriptor = Descriptor;
@@ -83,9 +93,7 @@ public:
 
 	void deallocate(void* Ptr, const AllocationDescriptor& Descriptor) noexcept
 	{
-		drainQuarantineToBudget();
-
-		if (!Ptr)
+		if (!Ptr || isZeroSizeAllocationPointer(Ptr))
 		{
 			return;
 		}
@@ -133,6 +141,7 @@ public:
 	void setCurrentFrame(const std::uint32_t Frame) noexcept
 	{
 		CurrentFrame.store(Frame, std::memory_order_relaxed);
+		ThreadCacheRegistry::onThreadIdle();
 	}
 
 	void onThreadExit() noexcept
@@ -187,6 +196,54 @@ public:
 	void flushDeferredFrees() noexcept
 	{
 		flushQuarantine();
+		ThreadCacheRegistry::onThreadIdle();
+	}
+
+	[[nodiscard]] RuntimeStats getRuntimeStats() noexcept
+	{
+		RuntimeStats stats;
+		const auto pageToSpanStats = CentralPool.getPageToSpanPoolStats();
+		stats.PageToSpanEntryCount = pageToSpanStats.EntryCount;
+		stats.PageToSpanLevel1NodesUsed = pageToSpanStats.Level1NodesUsed;
+		stats.PageToSpanLevel1NodesCapacity = pageToSpanStats.Level1NodesCapacity;
+		stats.PageToSpanLevel1UsageRatio = pageToSpanStats.Level1UsageRatio;
+		stats.PageToSpanLevel2NodesUsed = pageToSpanStats.Level2NodesUsed;
+		stats.PageToSpanLevel2NodesCapacity = pageToSpanStats.Level2NodesCapacity;
+		stats.PageToSpanLevel2UsageRatio = pageToSpanStats.Level2UsageRatio;
+		stats.PageToSpanPoolExhaustionWarningCount = pageToSpanStats.PoolExhaustionWarningCount;
+		stats.SpanObjectPoolAllocated = pageToSpanStats.SpanObjectsAllocated;
+		stats.SpanObjectPoolInUse = pageToSpanStats.SpanObjectsInUse;
+		stats.SpanObjectPoolUsageRatio = pageToSpanStats.SpanObjectPoolUsageRatio;
+
+		const auto regionIndexStats = PageAllocator.getRegionIndexPoolStats();
+		stats.RegionIndexRegionCount = regionIndexStats.RegionCount;
+		stats.RegionIndexEntryCount = regionIndexStats.EntryCount;
+		stats.RegionIndexLevel1NodesUsed = regionIndexStats.Level1NodesUsed;
+		stats.RegionIndexLevel1NodesCapacity = regionIndexStats.Level1NodesCapacity;
+		stats.RegionIndexLevel1UsageRatio = regionIndexStats.Level1UsageRatio;
+		stats.RegionIndexLevel2NodesUsed = regionIndexStats.Level2NodesUsed;
+		stats.RegionIndexLevel2NodesCapacity = regionIndexStats.Level2NodesCapacity;
+		stats.RegionIndexLevel2UsageRatio = regionIndexStats.Level2UsageRatio;
+		stats.RegionIndexPoolExhaustionWarningCount = regionIndexStats.PoolExhaustionWarningCount;
+
+		{
+			std::lock_guard Lock(DedicatedMutex);
+			stats.DedicatedAllocationCount = DedicatedAllocations.size();
+		}
+
+		{
+			std::lock_guard Lock(DedicatedCacheMutex);
+			stats.DedicatedCacheBucketCount = DedicatedRegionCache.size();
+			stats.DedicatedCacheBytes = DedicatedCacheBytes;
+		}
+
+		{
+			std::lock_guard Lock(QuarantineMutex);
+			stats.QuarantineEntryCount = SmallBlockQuarantine.size();
+			stats.QuarantineBytes = QuarantineBytes;
+		}
+
+		return stats;
 	}
 
 private:
@@ -222,6 +279,17 @@ private:
 	{
 		static std::atomic<bool> Value = false;
 		return Value;
+	}
+
+	[[nodiscard]] static void* getZeroSizeAllocationPointer() noexcept
+	{
+		alignas(std::max_align_t) static std::byte Sentinel = std::byte{0};
+		return &Sentinel;
+	}
+
+	[[nodiscard]] static bool isZeroSizeAllocationPointer(const void* Ptr) noexcept
+	{
+		return Ptr == getZeroSizeAllocationPointer();
 	}
 
 	void prepareContext(AllocationContext& Context)
@@ -268,7 +336,7 @@ private:
 		Context.Layout.RequestedSize = Context.Descriptor.Size;
 		Context.Layout.RequestedAlignment = Context.Descriptor.Alignment;
 
-		if (Config.EnableDebugGuards)
+		if constexpr (MemoryCompileEnableDebugGuards)
 		{
 			Context.Layout.HeaderSize = sizeof(DebugHeader);
 			Context.Layout.FrontGuard = 16;
@@ -349,8 +417,8 @@ private:
 				return true;
 			}
 
-			ThreadCache& cache = ThreadCacheRegistry::get();
-			const ThreadCacheAllocation decision = cache.allocate(
+			ThreadCache& Cache = ThreadCacheRegistry::get();
+			const ThreadCacheAllocation decision = Cache.allocate(
 				Context.Layout.SizeClassIndex,
 				Context.Layout.BlockSize);
 
@@ -435,7 +503,7 @@ private:
 			std::memset(Context.Runtime.UserPtr, AllocatedPattern, Context.Descriptor.Size);
 		}
 
-		if (!Config.EnableDebugGuards)
+		if constexpr (!MemoryCompileEnableDebugGuards)
 		{
 			return;
 		}
@@ -470,7 +538,7 @@ private:
 	void destroyLayout(AllocationContext& Context) noexcept
 	{
 		Context.Stage = AllocationStage::Destroy;
-		if (!Config.EnableDebugGuards)
+		if constexpr (!MemoryCompileEnableDebugGuards)
 		{
 			std::memset(Context.Runtime.UserPtr, FreedPattern, Context.Descriptor.Size);
 			return;
@@ -585,12 +653,7 @@ private:
 
 	[[nodiscard]] bool shouldQuarantineSmallBlock(const AllocationContext& Context) const noexcept
 	{
-		if (!Config.EnableUseAfterFreeDetection)
-		{
-			return false;
-		}
-
-		if (!Config.EnableDebugGuards)
+		if constexpr (!MemoryCompileEnableUseAfterFreeDetection || !MemoryCompileEnableDebugGuards)
 		{
 			return false;
 		}
@@ -610,6 +673,14 @@ private:
 		Entry.FrameIndex = Context.Metadata.FrameIndex;
 		Entry.ResourceId = Context.Metadata.ResourceId;
 		Entry.Lifetime = Context.Descriptor.Lifetime;
+
+		if constexpr (MemoryCompileQuarantineReleaseOnlyOnFlush)
+		{
+			std::lock_guard Lock(QuarantineMutex);
+			SmallBlockQuarantine.push_back(Entry);
+			QuarantineBytes += Entry.BlockSize;
+			return;
+		}
 
 		std::vector<SmallBlockQuarantineEntry> released;
 		{
@@ -678,22 +749,6 @@ private:
 		}
 
 		return true;
-	}
-
-	void drainQuarantineToBudget()
-	{
-		if (!Config.EnableUseAfterFreeDetection || !Config.EnableDebugGuards)
-		{
-			return;
-		}
-
-		std::vector<SmallBlockQuarantineEntry> released;
-		{
-			std::lock_guard Lock(QuarantineMutex);
-			collectQuarantineReleasesLocked(released, false);
-		}
-
-		releaseQuarantineEntries(released);
 	}
 
 	void flushQuarantine() noexcept
@@ -766,37 +821,37 @@ private:
 			return;
 		}
 
-		MemoryEvent event;
-		event.Type = MemoryEventType::Allocate;
-		event.UserPtr = Context.Runtime.UserPtr;
-		event.Size = Context.Descriptor.Size;
-		event.Alignment = Context.Descriptor.Alignment;
-		event.AllocationId = Context.Metadata.AllocationId;
-		event.Timestamp = Context.Metadata.Timestamp;
-		event.ThreadId = Context.Metadata.ThreadId;
-		event.FrameIndex = Context.Metadata.FrameIndex;
-		event.ResourceId = Context.Metadata.ResourceId;
-		event.FromThreadCache = Context.Runtime.IsFromThreadCache;
-		event.FromCentralPool = Context.Runtime.IsFromCentralPool;
-		event.FromOS = Context.Runtime.IsFromOS;
-		event.Context = &Context;
-		EventBus.emit(event);
+		MemoryEvent Event;
+		Event.Type = MemoryEventType::Allocate;
+		Event.UserPtr = Context.Runtime.UserPtr;
+		Event.Size = Context.Descriptor.Size;
+		Event.Alignment = Context.Descriptor.Alignment;
+		Event.AllocationId = Context.Metadata.AllocationId;
+		Event.Timestamp = Context.Metadata.Timestamp;
+		Event.ThreadId = Context.Metadata.ThreadId;
+		Event.FrameIndex = Context.Metadata.FrameIndex;
+		Event.ResourceId = Context.Metadata.ResourceId;
+		Event.FromThreadCache = Context.Runtime.IsFromThreadCache;
+		Event.FromCentralPool = Context.Runtime.IsFromCentralPool;
+		Event.FromOS = Context.Runtime.IsFromOS;
+		Event.Context = &Context;
+		EventBus.emit(Event);
 
 		if (Context.Runtime.IsFromThreadCache)
 		{
-			event.Type = MemoryEventType::ThreadCacheHit;
-			EventBus.emit(event);
+			Event.Type = MemoryEventType::ThreadCacheHit;
+			EventBus.emit(Event);
 		}
 		else
 		{
-			event.Type = MemoryEventType::ThreadCacheMiss;
-			EventBus.emit(event);
+			Event.Type = MemoryEventType::ThreadCacheMiss;
+			EventBus.emit(Event);
 		}
 
 		if (Context.Runtime.IsFromCentralPool)
 		{
-			event.Type = MemoryEventType::CentralFetch;
-			EventBus.emit(event);
+			Event.Type = MemoryEventType::CentralFetch;
+			EventBus.emit(Event);
 		}
 	}
 
@@ -808,26 +863,26 @@ private:
 			return;
 		}
 
-		MemoryEvent event;
-		event.Type = MemoryEventType::Deallocate;
-		event.UserPtr = Context.Runtime.UserPtr;
-		event.Size = Context.Descriptor.Size;
-		event.Alignment = Context.Descriptor.Alignment;
-		event.AllocationId = Context.Metadata.AllocationId;
-		event.Timestamp = Context.Metadata.Timestamp;
-		event.ThreadId = Context.Metadata.ThreadId;
-		event.FrameIndex = Context.Metadata.FrameIndex;
-		event.ResourceId = Context.Metadata.ResourceId;
-		event.FromThreadCache = !Context.Runtime.IsFromOS;
-		event.FromCentralPool = !Context.Runtime.IsFromOS;
-		event.FromOS = Context.Runtime.IsFromOS;
-		event.Context = &Context;
-		EventBus.emit(event);
+		MemoryEvent Event;
+		Event.Type = MemoryEventType::Deallocate;
+		Event.UserPtr = Context.Runtime.UserPtr;
+		Event.Size = Context.Descriptor.Size;
+		Event.Alignment = Context.Descriptor.Alignment;
+		Event.AllocationId = Context.Metadata.AllocationId;
+		Event.Timestamp = Context.Metadata.Timestamp;
+		Event.ThreadId = Context.Metadata.ThreadId;
+		Event.FrameIndex = Context.Metadata.FrameIndex;
+		Event.ResourceId = Context.Metadata.ResourceId;
+		Event.FromThreadCache = !Context.Runtime.IsFromOS;
+		Event.FromCentralPool = !Context.Runtime.IsFromOS;
+		Event.FromOS = Context.Runtime.IsFromOS;
+		Event.Context = &Context;
+		EventBus.emit(Event);
 
 		if (!Context.Runtime.IsFromOS)
 		{
-			event.Type = MemoryEventType::CentralReturn;
-			EventBus.emit(event);
+			Event.Type = MemoryEventType::CentralReturn;
+			EventBus.emit(Event);
 		}
 	}
 
@@ -838,18 +893,18 @@ private:
 			return;
 		}
 
-		MemoryEvent event;
-		event.Type = MemoryEventType::ValidationError;
-		event.UserPtr = Context.Runtime.UserPtr;
-		event.Size = Context.Descriptor.Size;
-		event.Alignment = Context.Descriptor.Alignment;
-		event.AllocationId = Context.Metadata.AllocationId;
-		event.Timestamp = Context.Metadata.Timestamp;
-		event.ThreadId = Context.Metadata.ThreadId;
-		event.FrameIndex = Context.Metadata.FrameIndex;
-		event.ResourceId = Context.Metadata.ResourceId;
-		event.Context = &Context;
-		EventBus.emit(event);
+		MemoryEvent Event;
+		Event.Type = MemoryEventType::ValidationError;
+		Event.UserPtr = Context.Runtime.UserPtr;
+		Event.Size = Context.Descriptor.Size;
+		Event.Alignment = Context.Descriptor.Alignment;
+		Event.AllocationId = Context.Metadata.AllocationId;
+		Event.Timestamp = Context.Metadata.Timestamp;
+		Event.ThreadId = Context.Metadata.ThreadId;
+		Event.FrameIndex = Context.Metadata.FrameIndex;
+		Event.ResourceId = Context.Metadata.ResourceId;
+		Event.Context = &Context;
+		EventBus.emit(Event);
 	}
 
 	void emitGuardCorruption(AllocationContext& Context) noexcept
@@ -859,18 +914,18 @@ private:
 			return;
 		}
 
-		MemoryEvent event;
-		event.Type = MemoryEventType::GuardCorruption;
-		event.UserPtr = Context.Runtime.UserPtr;
-		event.Size = Context.Descriptor.Size;
-		event.Alignment = Context.Descriptor.Alignment;
-		event.AllocationId = Context.Metadata.AllocationId;
-		event.Timestamp = Context.Metadata.Timestamp;
-		event.ThreadId = Context.Metadata.ThreadId;
-		event.FrameIndex = Context.Metadata.FrameIndex;
-		event.ResourceId = Context.Metadata.ResourceId;
-		event.Context = &Context;
-		EventBus.emit(event);
+		MemoryEvent Event;
+		Event.Type = MemoryEventType::GuardCorruption;
+		Event.UserPtr = Context.Runtime.UserPtr;
+		Event.Size = Context.Descriptor.Size;
+		Event.Alignment = Context.Descriptor.Alignment;
+		Event.AllocationId = Context.Metadata.AllocationId;
+		Event.Timestamp = Context.Metadata.Timestamp;
+		Event.ThreadId = Context.Metadata.ThreadId;
+		Event.FrameIndex = Context.Metadata.FrameIndex;
+		Event.ResourceId = Context.Metadata.ResourceId;
+		Event.Context = &Context;
+		EventBus.emit(Event);
 	}
 
 	void emitUseAfterFree(const SmallBlockQuarantineEntry& Entry) noexcept
@@ -880,23 +935,23 @@ private:
 			return;
 		}
 
-		MemoryEvent event;
-		event.Type = MemoryEventType::UseAfterFree;
-		event.UserPtr = Entry.RawPtr + Entry.UserOffset;
-		event.Size = Entry.UserSize;
-		event.Alignment = 0;
-		event.AllocationId = Entry.AllocationId;
-		event.Timestamp = timestampNs();
-		event.ThreadId = std::this_thread::get_id();
-		event.FrameIndex = Entry.FrameIndex;
-		event.ResourceId = Entry.ResourceId;
-		event.Context = nullptr;
-		EventBus.emit(event);
+		MemoryEvent Event;
+		Event.Type = MemoryEventType::UseAfterFree;
+		Event.UserPtr = Entry.RawPtr + Entry.UserOffset;
+		Event.Size = Entry.UserSize;
+		Event.Alignment = 0;
+		Event.AllocationId = Entry.AllocationId;
+		Event.Timestamp = timestampNs();
+		Event.ThreadId = std::this_thread::get_id();
+		Event.FrameIndex = Entry.FrameIndex;
+		Event.ResourceId = Entry.ResourceId;
+		Event.Context = nullptr;
+		EventBus.emit(Event);
 	}
 
 	[[nodiscard]] std::uint32_t captureStackId() const noexcept
 	{
-		if (!Config.CaptureStack)
+		if constexpr (!MemoryCompileCaptureStack)
 		{
 			return 0;
 		}
@@ -906,6 +961,16 @@ private:
 		const USHORT count = ::RtlCaptureStackBackTrace(2, 16, frames, nullptr);
 		std::uint64_t hash = 1469598103934665603ull;
 		for (USHORT i = 0; i < count; ++i)
+		{
+			hash ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(frames[i]));
+			hash *= 1099511628211ull;
+		}
+		return static_cast<std::uint32_t>(hash ^ (hash >> 32));
+#elif defined(__linux__) || defined(__APPLE__)
+		void* frames[16]{};
+		const int count = ::backtrace(frames, 16);
+		std::uint64_t hash = 1469598103934665603ull;
+		for (int i = 0; i < count; ++i)
 		{
 			hash ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(frames[i]));
 			hash *= 1099511628211ull;
@@ -954,6 +1019,8 @@ private:
 class AllocatorFacade
 {
 public:
+	using RuntimeStats = MemoryAllocatorEngine::RuntimeStats;
+
 	/**
 	 * @brief Configure allocator before first runtime use.
 	 * @param
@@ -978,29 +1045,53 @@ public:
 	 * @usage
 	 *     - Use as default entry for engine systems that need tracked allocations.
 	 * @return
-	 *     - void*  User payload pointer. Throws std::bad_alloc on failure.
+	 *     - void*  User payload pointer. Throws std::bad_alloc on failure unless IsNoThrow is true.
 	 */
 	[[nodiscard]] static void* allocate(
 		const std::size_t Size,
 		const std::size_t Alignment = alignof(std::max_align_t),
 		const std::uint32_t ResourceId = 0,
 		const bool ZeroMemory = false,
-		const AllocationLifetime Lifetime = AllocationLifetime::Default)
+		const AllocationLifetime Lifetime = AllocationLifetime::Default,
+		const bool IsNoThrow = false)
 	{
 		AllocationDescriptor Descriptor;
 		Descriptor.Size = Size;
 		Descriptor.Alignment = Alignment;
 		Descriptor.IsZeroMemory = ZeroMemory;
+		Descriptor.IsNoThrow = IsNoThrow;
 		Descriptor.ResourceId = ResourceId;
 		Descriptor.Lifetime = Lifetime;
 
 		void* Ptr = MemoryAllocatorEngine::Self().allocate(Descriptor);
-		if (!Ptr)
+		if (!Ptr && !Descriptor.IsNoThrow)
 		{
 			throw std::bad_alloc();
 		}
 
 		return Ptr;
+	}
+
+	/**
+	 * @brief Allocate memory with nothrow semantics.
+	 * @param
+	 *     - Size        std::size_t   Requested bytes.
+	 *     - Alignment   std::size_t   Required alignment.
+	 *     - ResourceId  std::uint32_t Optional resource grouping id.
+	 *     - ZeroMemory  bool          Whether user payload should be zero-filled.
+	 * @usage
+	 *     - Use when callers need null-on-failure behavior instead of exceptions.
+	 * @return
+	 *     - void*  User payload pointer or nullptr on allocation failure.
+	 */
+	[[nodiscard]] static void* allocateNoThrow(
+		const std::size_t Size,
+		const std::size_t Alignment = alignof(std::max_align_t),
+		const std::uint32_t ResourceId = 0,
+		const bool ZeroMemory = false,
+		const AllocationLifetime Lifetime = AllocationLifetime::Default) noexcept
+	{
+		return allocate(Size, Alignment, ResourceId, ZeroMemory, Lifetime, true);
 	}
 
 	/**
@@ -1051,9 +1142,10 @@ public:
 		const std::size_t Size,
 		const std::size_t Alignment = alignof(std::max_align_t),
 		const std::uint32_t ResourceId = 0,
-		const bool ZeroMemory = false)
+		const bool ZeroMemory = false,
+		const bool IsNoThrow = false)
 	{
-		return allocate(Size, Alignment, ResourceId, ZeroMemory, AllocationLifetime::Transient);
+		return allocate(Size, Alignment, ResourceId, ZeroMemory, AllocationLifetime::Transient, IsNoThrow);
 	}
 
 	/**
@@ -1064,7 +1156,7 @@ public:
 	 *     - ResourceId  std::uint32_t Optional resource grouping id.
 	 *     - ZeroMemory  bool          Whether user payload should be zero-filled.
 	 * @usage
-	 *     - Use for resources with long lifetime to reduce TLS cache pollution.
+	 *     - Use for resources with long lifetime to reduce TLS Cache pollution.
 	 * @return
 	 *     - void*  User payload pointer.
 	 */
@@ -1072,9 +1164,10 @@ public:
 		const std::size_t Size,
 		const std::size_t Alignment = alignof(std::max_align_t),
 		const std::uint32_t ResourceId = 0,
-		const bool ZeroMemory = false)
+		const bool ZeroMemory = false,
+		const bool IsNoThrow = false)
 	{
-		return allocate(Size, Alignment, ResourceId, ZeroMemory, AllocationLifetime::Persistent);
+		return allocate(Size, Alignment, ResourceId, ZeroMemory, AllocationLifetime::Persistent, IsNoThrow);
 	}
 
 	/**
@@ -1121,7 +1214,7 @@ public:
 
 	template <typename ObserverType>
 	/**
-	 * @brief Bind Observer to global memory event bus.
+	 * @brief Bind Observer to global memory Event bus.
 	 * @param
 	 *     - Observer  ObserverType&  Observer instance implementing onMemoryEvent().
 	 * @usage
@@ -1136,7 +1229,7 @@ public:
 
 	template <typename ObserverType>
 	/**
-	 * @brief Unbind Observer from global memory event bus.
+	 * @brief Unbind Observer from global memory Event bus.
 	 * @param
 	 *     - Observer  ObserverType&  Observer instance previously bound.
 	 * @usage
@@ -1150,13 +1243,13 @@ public:
 	}
 
 	/**
-	 * @brief Access global memory event bus.
+	 * @brief Access global memory Event bus.
 	 * @param
 	 *     - none
 	 * @usage
 	 *     - Bind statistics, leak, and profiling observers through this API.
 	 * @return
-	 *     - MemoryEventBus&  Shared event bus instance.
+	 *     - MemoryEventBus&  Shared Event bus instance.
 	 */
 	[[nodiscard]] static MemoryEventBus& getEventBus()
 	{
@@ -1164,7 +1257,7 @@ public:
 	}
 
 	/**
-	 * @brief Flush and release current thread cache explicitly.
+	 * @brief Flush and release current thread Cache explicitly.
 	 * @param
 	 *     - none
 	 * @usage
@@ -1217,6 +1310,20 @@ public:
 	[[nodiscard]] static std::size_t prewarm(const std::vector<MemoryPrewarmRequest>& Requests)
 	{
 		return MemoryAllocatorEngine::Self().prewarm(Requests);
+	}
+
+	/**
+	 * @brief Read runtime allocator counters useful for diagnostics dashboards.
+	 * @param
+	 *     - none
+	 * @usage
+	 *     - Poll periodically to observe quarantine pressure and dedicated Cache occupancy.
+	 * @return
+	 *     - RuntimeStats  Current allocator runtime counters.
+	 */
+	[[nodiscard]] static RuntimeStats getStats()
+	{
+		return MemoryAllocatorEngine::Self().getRuntimeStats();
 	}
 
 };

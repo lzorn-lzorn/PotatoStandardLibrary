@@ -2,12 +2,15 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
+
+#include "../Containers/radix_tree.h"
 
 #include "memory_common.h"
 
@@ -48,6 +51,7 @@ struct PageSpan
     std::size_t PageCount = 0;
     std::size_t PageSize = 0;
     void* OwnerRegion = nullptr;
+    std::uint64_t OwnerRegionId = 0;
 
     [[nodiscard]] bool isValid() const noexcept
     {
@@ -119,59 +123,78 @@ public:
         const bool HugePage,
         const std::int32_t NumaNode) noexcept
     {
-        const std::size_t pageSize = HugePage && getHugePageSize() > 0 ? getHugePageSize() : getSystemPageSize();
-        const std::size_t AlignedBytes = alignUp(Bytes, pageSize);
+        const std::size_t systemPageSize = getSystemPageSize();
+        const std::size_t hugePageSize = getHugePageSize();
+        const bool requestHugePage = HugePage && hugePageSize > 0;
+        const std::size_t requestPageSize = requestHugePage ? hugePageSize : systemPageSize;
+        const std::size_t AlignedBytes = alignUp(Bytes, requestPageSize);
         if (AlignedBytes == 0)
         {
             return {};
         }
 
 #if defined(_WIN32)
-        DWORD AllocType = MEM_RESERVE;
-        if (HugePage && getHugePageSize() > 0)
+        std::byte* Base = nullptr;
+        bool HugePageMapped = false;
+
+        if (requestHugePage)
         {
-            AllocType |= MEM_LARGE_PAGES;
+            const DWORD hugeAllocType = MEM_RESERVE | MEM_LARGE_PAGES;
+            Base = static_cast<std::byte*>(
+                allocateWindows(nullptr, AlignedBytes, hugeAllocType, PAGE_READWRITE, NumaNode));
+            HugePageMapped = Base != nullptr;
         }
 
-        std::byte* base = static_cast<std::byte*>(allocateWindows(nullptr, AlignedBytes, AllocType, PAGE_READWRITE, NumaNode));
-
-        if (!base && (AllocType & MEM_LARGE_PAGES) != 0)
+        if (!Base)
         {
-            base = static_cast<std::byte*>(allocateWindows(nullptr, AlignedBytes, MEM_RESERVE, PAGE_READWRITE, NumaNode));
+            Base = static_cast<std::byte*>(allocateWindows(nullptr, AlignedBytes, MEM_RESERVE, PAGE_READWRITE, NumaNode));
+            HugePageMapped = false;
         }
 
-        if (!base)
+        if (!Base)
         {
             return {};
         }
 
         VirtualRegion Region;
-        Region.Base = base;
+        Region.Base = Base;
         Region.ReservedSize = AlignedBytes;
-        Region.PageSize = pageSize;
+        Region.PageSize = HugePageMapped ? hugePageSize : systemPageSize;
         Region.NumaNode = NumaNode;
-        Region.HugePage = HugePage && (AllocType & MEM_LARGE_PAGES) != 0;
+        Region.HugePage = HugePageMapped;
         return Region;
 #else
-        int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        int Flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        bool HugePageMapped = false;
 #if defined(MAP_HUGETLB)
-        if (HugePage)
+        if (requestHugePage)
         {
-            flags |= MAP_HUGETLB;
+            Flags |= MAP_HUGETLB;
+            HugePageMapped = true;
         }
 #endif
-        void* base = ::mmap(nullptr, AlignedBytes, PROT_NONE, flags, -1, 0);
-        if (base == MAP_FAILED)
+        void* Base = ::mmap(nullptr, AlignedBytes, PROT_NONE, Flags, -1, 0);
+
+    #if defined(MAP_HUGETLB)
+        if (Base == MAP_FAILED && HugePageMapped)
+        {
+            Flags &= ~MAP_HUGETLB;
+            HugePageMapped = false;
+            Base = ::mmap(nullptr, AlignedBytes, PROT_NONE, Flags, -1, 0);
+        }
+    #endif
+
+        if (Base == MAP_FAILED)
         {
             return {};
         }
 
         VirtualRegion Region;
-        Region.Base = static_cast<std::byte*>(base);
+        Region.Base = static_cast<std::byte*>(Base);
         Region.ReservedSize = AlignedBytes;
-        Region.PageSize = pageSize;
+        Region.PageSize = HugePageMapped ? hugePageSize : systemPageSize;
         Region.NumaNode = NumaNode;
-        Region.HugePage = HugePage;
+        Region.HugePage = HugePageMapped;
         return Region;
 #endif
     }
@@ -180,7 +203,7 @@ public:
      * @brief Commit a sub-range inside a reserved Region.
      * @param
      *     - Region  VirtualRegion&  Region metadata to update.
-     *     - Offset  std::size_t     Start offset from Region base.
+     *     - Offset  std::size_t     Start offset from Region Base.
      *     - Bytes   std::size_t     Commit length.
      * @usage
      *     - Call before handing a page span to upper allocator layers.
@@ -202,14 +225,8 @@ public:
         }
 
 #if defined(_WIN32)
-        DWORD AllocType = MEM_COMMIT;
-        if (Region.HugePage)
-        {
-            AllocType |= MEM_LARGE_PAGES;
-        }
-
-        void* committed = ::VirtualAlloc(Region.Base + AlignedOffset, AlignedBytes, AllocType, PAGE_READWRITE);
-        if (!committed)
+        void* Committed = ::VirtualAlloc(Region.Base + AlignedOffset, AlignedBytes, MEM_COMMIT, PAGE_READWRITE);
+        if (!Committed)
         {
             return false;
         }
@@ -225,10 +242,10 @@ public:
     }
 
     /**
-     * @brief Decommit a committed sub-range while keeping virtual address stable.
+     * @brief Decommit a Committed sub-range while keeping virtual address stable.
      * @param
      *     - Region  VirtualRegion&  Region metadata to update.
-     *     - Offset  std::size_t     Start offset from Region base.
+     *     - Offset  std::size_t     Start offset from Region Base.
      *     - Bytes   std::size_t     Decommit length.
      * @usage
      *     - Use for lazy reclamation without invalidating reserved address range.
@@ -377,10 +394,29 @@ private:
 class PageAllocator
 {
 public:
+    struct RegionIndexPoolStats
+    {
+        std::size_t RegionCount = 0;
+        std::size_t EntryCount = 0;
+        std::size_t Level1NodesUsed = 0;
+        std::size_t Level1NodesCapacity = 0;
+        std::size_t Level2NodesUsed = 0;
+        std::size_t Level2NodesCapacity = 0;
+        double Level1UsageRatio = 0.0;
+        double Level2UsageRatio = 0.0;
+        std::size_t PoolExhaustionWarningCount = 0;
+    };
+
     explicit PageAllocator(const AllocatorConfig& InConfig)
         : Config(InConfig)
         , PageSize(VirtualMemoryManager::getSystemPageSize())
+        , ShardCount(determineShardCount())
+        , Shards(std::make_unique<Shard[]>(ShardCount))
     {
+        for (std::size_t i = 0; i < ShardCount; ++i)
+        {
+            Shards[i].NextRegionId = i == 0 ? ShardCount : i;
+        }
     }
 
     ~PageAllocator()
@@ -405,6 +441,29 @@ public:
         return PageSize;
     }
 
+    [[nodiscard]] RegionIndexPoolStats getRegionIndexPoolStats()
+    {
+        RegionIndexPoolStats stats;
+
+        for (std::size_t i = 0; i < ShardCount; ++i)
+        {
+            Shard& shard = Shards[i];
+            std::lock_guard Lock(shard.Mutex);
+
+            stats.RegionCount += shard.Regions.size();
+            stats.EntryCount += shard.RegionIndex.size();
+            stats.Level1NodesUsed += shard.RegionIndex.level1NodesUsed();
+            stats.Level1NodesCapacity += shard.RegionIndex.level1NodesCapacity();
+            stats.Level2NodesUsed += shard.RegionIndex.level2NodesUsed();
+            stats.Level2NodesCapacity += shard.RegionIndex.level2NodesCapacity();
+            stats.PoolExhaustionWarningCount += shard.RegionIndex.poolExhaustionFailureCount();
+        }
+
+        stats.Level1UsageRatio = toUsageRatio(stats.Level1NodesUsed, stats.Level1NodesCapacity);
+        stats.Level2UsageRatio = toUsageRatio(stats.Level2NodesUsed, stats.Level2NodesCapacity);
+        return stats;
+    }
+
     /**
      * @brief Acquire a contiguous span with page granularity.
      * @param
@@ -421,31 +480,37 @@ public:
             return {};
         }
 
-        std::lock_guard lock(Mutex);
+        Shard& shard = getShardForCurrentThread();
+        std::lock_guard Lock(shard.Mutex);
 
         // 优先命中 free cache，保证 Span 的地址复用和延迟稳定性。
-        auto CacheIt = FreeSpanCache.find(PageCount);
-        if (CacheIt != FreeSpanCache.end() && !CacheIt->second.empty())
+        PageSpan CachedSpan;
+        if (tryPopCachedSpanLocked(shard, PageCount, CachedSpan))
         {
-            PageSpan Span = CacheIt->second.back();
-            CacheIt->second.pop_back();
-
-            auto* owner = static_cast<RegionCursor*>(Span.OwnerRegion);
+            RegionCursor* owner = findRegionByIdLocked(shard, CachedSpan.OwnerRegionId);
             if (!owner || !owner->Region.isValid())
             {
                 return {};
             }
 
-            const std::size_t offset = static_cast<std::size_t>(Span.Base - owner->Region.Base);
-            if (!VirtualMemoryManager::commit(owner->Region, offset, Span.getBytes()))
+            const std::size_t offset = static_cast<std::size_t>(CachedSpan.Base - owner->Region.Base);
+            const std::size_t spanBytes = CachedSpan.getBytes();
+            if (offset > owner->Region.ReservedSize || spanBytes > owner->Region.ReservedSize - offset)
             {
                 return {};
             }
 
-            return Span;
+            if (!VirtualMemoryManager::commit(owner->Region, offset, CachedSpan.getBytes()))
+            {
+                return {};
+            }
+
+            CachedSpan.OwnerRegion = owner;
+
+            return CachedSpan;
         }
 
-        for (RegionCursor& Cursor : Regions)
+        for (RegionCursor& Cursor : shard.Regions)
         {
             const std::size_t availablePages = Cursor.ReservedPages - Cursor.NextPage;
             if (availablePages < PageCount)
@@ -458,6 +523,7 @@ public:
             Span.PageCount = PageCount;
             Span.PageSize = PageSize;
             Span.OwnerRegion = &Cursor;
+            Span.OwnerRegionId = Cursor.RegionId;
 
             const std::size_t offset = Cursor.NextPage * PageSize;
             Cursor.NextPage += PageCount;
@@ -486,22 +552,32 @@ public:
 
         RegionCursor Cursor;
         Cursor.Region = Region;
+        Cursor.RegionId = shard.NextRegionId;
+        shard.NextRegionId += ShardCount;
         Cursor.ReservedPages = reserveBytes / PageSize;
 
-        Regions.push_back(std::move(Cursor));
-        RegionCursor& back = Regions.back();
+        shard.Regions.push_back(std::move(Cursor));
+        RegionCursor& back = shard.Regions.back();
+        if (!shard.RegionIndex.insertOrAssign(back.RegionId, &back))
+        {
+            VirtualMemoryManager::release(back.Region);
+            shard.Regions.pop_back();
+            return {};
+        }
 
         PageSpan Span;
         Span.Base = back.Region.Base;
         Span.PageCount = PageCount;
         Span.PageSize = PageSize;
         Span.OwnerRegion = &back;
+        Span.OwnerRegionId = back.RegionId;
         back.NextPage = PageCount;
 
         if (!VirtualMemoryManager::commit(back.Region, 0, Span.getBytes()))
         {
             VirtualMemoryManager::release(back.Region);
-            Regions.pop_back();
+            shard.RegionIndex.erase(back.RegionId);
+            shard.Regions.pop_back();
             return {};
         }
 
@@ -524,41 +600,166 @@ public:
             return;
         }
 
-        std::lock_guard lock(Mutex);
-        auto* owner = static_cast<RegionCursor*>(Span.OwnerRegion);
-        if (owner && owner->Region.isValid() && Config.LazyCommit)
+        Shard& shard = getShard(Span.OwnerRegionId);
+        std::lock_guard Lock(shard.Mutex);
+        RegionCursor* owner = findRegionByIdLocked(shard, Span.OwnerRegionId);
+        if (owner && owner->Region.isValid())
         {
-            const std::size_t offset = static_cast<std::size_t>(Span.Base - owner->Region.Base);
-            VirtualMemoryManager::decommit(owner->Region, offset, Span.getBytes());
+            if constexpr (MemoryCompileLazyCommit)
+            {
+                const std::size_t offset = static_cast<std::size_t>(Span.Base - owner->Region.Base);
+                const std::size_t spanBytes = Span.getBytes();
+                if (offset <= owner->Region.ReservedSize && spanBytes <= owner->Region.ReservedSize - offset)
+                {
+                    VirtualMemoryManager::decommit(owner->Region, offset, spanBytes);
+                }
+            }
         }
 
-        FreeSpanCache[Span.PageCount].push_back(Span);
+        pushCachedSpanLocked(shard, Span);
     }
 
 private:
+    static constexpr std::size_t MaxCachedPageCount = 65535;
+    static constexpr std::size_t MaxShardCount = 16;
+
+    [[nodiscard]] static double toUsageRatio(const std::size_t used, const std::size_t capacity) noexcept
+    {
+        if (capacity == 0)
+        {
+            return 0.0;
+        }
+
+        return static_cast<double>(used) / static_cast<double>(capacity);
+    }
+
     struct RegionCursor
     {
         VirtualRegion Region;
+        std::uint64_t RegionId = 0;
         std::size_t ReservedPages = 0;
         std::size_t NextPage = 0;
     };
 
+    struct Shard
+    {
+        std::mutex Mutex;
+        std::deque<RegionCursor> Regions;
+        core::containers::RadixTreeMap<RegionCursor*, 0, 16, 10, 10, 32, 512> RegionIndex;
+        std::array<std::vector<PageSpan>, MaxCachedPageCount + 1> FreeSpanCache{};
+        std::vector<PageSpan> OversizedFreeSpanCache;
+        std::uint64_t NextRegionId = 1;
+    };
+
+    [[nodiscard]] static std::size_t determineShardCount() noexcept
+    {
+        const std::size_t hardware = std::thread::hardware_concurrency();
+        const std::size_t desired = hardware == 0 ? 8u : hardware;
+        return std::max<std::size_t>(1, std::min<std::size_t>(desired, MaxShardCount));
+    }
+
+    [[nodiscard]] std::size_t selectShardIndex() const noexcept
+    {
+        if (ShardCount <= 1)
+        {
+            return 0;
+        }
+
+        const std::size_t hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        return hash % ShardCount;
+    }
+
+    [[nodiscard]] Shard& getShardForCurrentThread() noexcept
+    {
+        return Shards[selectShardIndex()];
+    }
+
+    [[nodiscard]] Shard& getShard(const std::uint64_t RegionId) noexcept
+    {
+        if (ShardCount <= 1)
+        {
+            return Shards[0];
+        }
+
+        return Shards[static_cast<std::size_t>(RegionId % ShardCount)];
+    }
+
+    [[nodiscard]] bool tryPopCachedSpanLocked(Shard& ShardState, const std::size_t PageCount, PageSpan& OutSpan)
+    {
+        if (PageCount <= MaxCachedPageCount)
+        {
+            std::vector<PageSpan>& bucket = ShardState.FreeSpanCache[PageCount];
+            if (bucket.empty())
+            {
+                return false;
+            }
+
+            OutSpan = bucket.back();
+            bucket.pop_back();
+            return true;
+        }
+
+        for (std::size_t i = 0; i < ShardState.OversizedFreeSpanCache.size(); ++i)
+        {
+            if (ShardState.OversizedFreeSpanCache[i].PageCount != PageCount)
+            {
+                continue;
+            }
+
+            OutSpan = ShardState.OversizedFreeSpanCache[i];
+            ShardState.OversizedFreeSpanCache[i] = ShardState.OversizedFreeSpanCache.back();
+            ShardState.OversizedFreeSpanCache.pop_back();
+            return true;
+        }
+
+        return false;
+    }
+
+    void pushCachedSpanLocked(Shard& ShardState, const PageSpan& Span)
+    {
+        if (Span.PageCount <= MaxCachedPageCount)
+        {
+            ShardState.FreeSpanCache[Span.PageCount].push_back(Span);
+            return;
+        }
+
+        ShardState.OversizedFreeSpanCache.push_back(Span);
+    }
+
+    [[nodiscard]] RegionCursor* findRegionByIdLocked(Shard& ShardState, const std::uint64_t RegionId) noexcept
+    {
+        if (RegionId == 0)
+        {
+            return nullptr;
+        }
+
+        return ShardState.RegionIndex.find(RegionId);
+    }
+
     void releaseAllRegions()
     {
-        std::lock_guard lock(Mutex);
-        for (RegionCursor& cursor : Regions)
+        for (std::size_t i = 0; i < ShardCount; ++i)
         {
-            VirtualMemoryManager::release(cursor.Region);
+            Shard& shard = Shards[i];
+            std::lock_guard Lock(shard.Mutex);
+            for (RegionCursor& cursor : shard.Regions)
+            {
+                VirtualMemoryManager::release(cursor.Region);
+            }
+            shard.Regions.clear();
+            shard.RegionIndex.clear();
+            for (std::vector<PageSpan>& bucket : shard.FreeSpanCache)
+            {
+                bucket.clear();
+            }
+            shard.OversizedFreeSpanCache.clear();
         }
-        Regions.clear();
-        FreeSpanCache.clear();
     }
 
     AllocatorConfig Config;
     std::size_t PageSize;
-    std::mutex Mutex;
-    std::deque<RegionCursor> Regions;
-    std::unordered_map<std::size_t, std::vector<PageSpan>> FreeSpanCache;
+    std::size_t ShardCount = 1;
+    std::unique_ptr<Shard[]> Shards;
 };
 
 } // namespace core::mem

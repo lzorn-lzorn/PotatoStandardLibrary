@@ -52,6 +52,62 @@ The [Test/CMakeLists.txt](Test/CMakeLists.txt) file is intentionally simple. Eve
 
 This keeps test registration modular: adding one new file adds one new test without editing the test CMake file.
 
+## Memory allocator path
+
+The allocator is split into a facade, a thread cache, a central pool, and a page allocator. The hot path is intentionally short, while slower fallbacks handle cache misses and large allocations.
+
+### Allocation flow
+
+When user code calls `AllocatorFacade::allocate...`, the request is first routed into `MemoryAllocatorEngine::allocate()` in [Core/Memory/memory_facade.h](Core/Memory/memory_facade.h).
+
+The allocation path is:
+
+1. Build the `AllocationContext` and capture metadata such as thread id, timestamp, allocation id, resource id, frame index, and stack id.
+2. Validate the request size and alignment.
+3. Build the memory layout, including guard regions when debug guards are enabled.
+4. Decide the backing strategy:
+   - small allocations use the central size-class system;
+   - persistent small allocations fetch directly from `CentralPool`;
+   - transient small allocations try the thread-local `ThreadCache` first;
+   - large or non-size-class allocations fall back to dedicated virtual regions from `PageAllocator`.
+5. Initialize the user buffer, fill debug headers and guards when enabled, and emit the allocation event.
+
+For small allocations, the control flow is:
+
+- `ThreadCacheRegistry::get()` creates or returns the current thread cache;
+- `ThreadCache::allocate()` serves a block from the local freelist if available;
+- if the thread cache misses, it refills from `CentralPool::fetchBatch()`;
+- if the central pool cannot satisfy the request, allocation fails with `not_enough_memory`.
+
+### Deallocation flow
+
+When user code calls `AllocatorFacade::deallocate...`, the request is routed back into `MemoryAllocatorEngine::deallocate()`.
+
+The deallocation path is:
+
+1. Reject null pointers and the zero-size sentinel.
+2. Rebuild the allocation context from the original descriptor and validate it again.
+3. Rebuild the layout so the allocator knows whether the pointer belongs to a small block or a dedicated region.
+4. If the pointer was backed by a dedicated virtual region, remove it from the dedicated map, destroy the layout, and return the region to the OS.
+5. Otherwise free the small block:
+   - persistent small blocks are returned to `CentralPool::returnBatch()`;
+   - transient small blocks are returned to the current thread cache through `ThreadCacheRegistry::get().deallocate()`.
+6. If use-after-free quarantine is enabled, the block is queued first and released later from quarantine.
+7. Emit the deallocation event after the backing storage has been handled.
+
+### Thread cache draining and shutdown
+
+The thread cache keeps a bounded freelist per size class. When a freelist grows beyond its configured limit, or when the cache exceeds its byte budget, `ThreadCache::deallocate()` drains a batch back to the central pool through `ThreadCache::drainToCentral()`.
+
+On thread exit, `ThreadCacheRegistry::onThreadExit()` flushes the remaining local blocks back to the central pool and destroys the thread-local cache. This prevents long-lived threads from hoarding memory indefinitely.
+
+### Why the path is structured this way
+
+- The thread cache avoids taking central locks on the hottest allocation/deallocation path.
+- The central pool amortizes synchronization by moving blocks in batches.
+- Dedicated regions keep large or non-standard requests out of the small-object machinery.
+- Debug guards and quarantine stay outside the fast path unless explicitly enabled.
+
 ## Detailed modular configuration flow
 
 ### 1. Prerequisites

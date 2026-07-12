@@ -25,6 +25,38 @@ struct MemoryStatisticsSnapshot
 	std::size_t PeakBytes = 0;
 };
 
+struct AllocatorRuntimeStatsSnapshot
+{
+	std::size_t DedicatedAllocationCount = 0;
+	std::size_t DedicatedCacheBucketCount = 0;
+	std::size_t DedicatedCacheBytes = 0;
+	std::size_t QuarantineEntryCount = 0;
+	std::size_t QuarantineBytes = 0;
+
+	std::size_t PageToSpanEntryCount = 0;
+	std::size_t PageToSpanLevel1NodesUsed = 0;
+	std::size_t PageToSpanLevel1NodesCapacity = 0;
+	double PageToSpanLevel1UsageRatio = 0.0;
+	std::size_t PageToSpanLevel2NodesUsed = 0;
+	std::size_t PageToSpanLevel2NodesCapacity = 0;
+	double PageToSpanLevel2UsageRatio = 0.0;
+	std::size_t PageToSpanPoolExhaustionWarningCount = 0;
+
+	std::size_t SpanObjectPoolAllocated = 0;
+	std::size_t SpanObjectPoolInUse = 0;
+	double SpanObjectPoolUsageRatio = 0.0;
+
+	std::size_t RegionIndexRegionCount = 0;
+	std::size_t RegionIndexEntryCount = 0;
+	std::size_t RegionIndexLevel1NodesUsed = 0;
+	std::size_t RegionIndexLevel1NodesCapacity = 0;
+	double RegionIndexLevel1UsageRatio = 0.0;
+	std::size_t RegionIndexLevel2NodesUsed = 0;
+	std::size_t RegionIndexLevel2NodesCapacity = 0;
+	double RegionIndexLevel2UsageRatio = 0.0;
+	std::size_t RegionIndexPoolExhaustionWarningCount = 0;
+};
+
 class MemoryStatisticsObserver
 {
 public:
