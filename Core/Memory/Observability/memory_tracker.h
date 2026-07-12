@@ -25,6 +25,7 @@ namespace core::mem
 {
 
 inline constexpr std::size_t MemoryTrackerUnknownSize = std::numeric_limits<std::size_t>::max();
+inline constexpr std::size_t MemoryTrackerDefaultMaxTimelineEntries = 10000;
 
 enum class HookAllocationOp : std::uint8_t
 {
@@ -428,6 +429,11 @@ private:
 class MemoryTracker
 {
 public:
+	[[nodiscard]] static constexpr bool isCompiledEnabled() noexcept
+	{
+		return MemoryCompileEnableDebugGuards;
+	}
+
 	/**
 	 * @brief Convert memory events into tracker records and statistics.
 	 * @param
@@ -439,6 +445,12 @@ public:
 	 */
 	void onMemoryEvent(const MemoryEvent& Event)
 	{
+		if constexpr (!isCompiledEnabled())
+		{
+			(void)Event;
+			return;
+		}
+
 		global().recordEngineEvent(Event);
 	}
 
@@ -462,6 +474,16 @@ public:
 		const std::size_t Alignment,
 		void* Caller)
 	{
+		if constexpr (!isCompiledEnabled())
+		{
+			(void)Operation;
+			(void)Ptr;
+			(void)Size;
+			(void)Alignment;
+			(void)Caller;
+			return;
+		}
+
 		global().recordHookAllocation(Operation, Ptr, Size, Alignment, Caller);
 	}
 
@@ -485,6 +507,16 @@ public:
 		const std::size_t Alignment,
 		void* Caller)
 	{
+		if constexpr (!isCompiledEnabled())
+		{
+			(void)Operation;
+			(void)Ptr;
+			(void)Size;
+			(void)Alignment;
+			(void)Caller;
+			return;
+		}
+
 		global().recordHookFree(Operation, Ptr, Size, Alignment, Caller);
 	}
 
@@ -506,6 +538,15 @@ public:
 		const std::size_t NewSize,
 		void* Caller)
 	{
+		if constexpr (!isCompiledEnabled())
+		{
+			(void)OldPtr;
+			(void)NewPtr;
+			(void)NewSize;
+			(void)Caller;
+			return;
+		}
+
 		global().recordHookReallocate(OldPtr, NewPtr, NewSize, Caller);
 	}
 
@@ -527,6 +568,15 @@ public:
 		const std::size_t Alignment,
 		void* Caller)
 	{
+		if constexpr (!isCompiledEnabled())
+		{
+			(void)Operation;
+			(void)Size;
+			(void)Alignment;
+			(void)Caller;
+			return;
+		}
+
 		global().recordHookAllocationFailure(Operation, Size, Alignment, Caller);
 	}
 
@@ -560,11 +610,23 @@ public:
 
 	static void setHookEnabled(const bool Enabled)
 	{
+		if constexpr (!isCompiledEnabled())
+		{
+			global().HookEnabled.store(false, std::memory_order_release);
+			(void)Enabled;
+			return;
+		}
+
 		global().HookEnabled.store(Enabled, std::memory_order_release);
 	}
 
 	[[nodiscard]] static bool isHookEnabled()
 	{
+		if constexpr (!isCompiledEnabled())
+		{
+			return false;
+		}
+
 		return global().HookEnabled.load(std::memory_order_acquire);
 	}
 
@@ -596,6 +658,22 @@ public:
 	{
 		std::lock_guard Lock(global().Mutex);
 		return global().FreedHistoryLimit;
+	}
+
+	static void setMaxTimelineEntries(const std::size_t Limit)
+	{
+		std::lock_guard Lock(global().Mutex);
+		global().MaxTimelineEntries = Limit;
+		while (global().Timeline.size() > global().MaxTimelineEntries)
+		{
+			global().Timeline.pop_front();
+		}
+	}
+
+	[[nodiscard]] static std::size_t getMaxTimelineEntries()
+	{
+		std::lock_guard Lock(global().Mutex);
+		return global().MaxTimelineEntries;
 	}
 
 	/**
@@ -645,7 +723,7 @@ public:
 		std::lock_guard Lock(global().Mutex);
 		MemoryTrackerReport Report;
 		Report.Statistics = global().Statistics;
-		Report.Timeline = global().Timeline;
+		Report.Timeline.assign(global().Timeline.begin(), global().Timeline.end());
 		Report.Issues = global().Issues;
 		Report.LiveAllocations = global().buildLiveAllocationSnapshotLocked();
 		return Report;
@@ -713,6 +791,7 @@ private:
 		std::size_t Alignment = MemoryTrackerUnknownSize;
 		std::uint64_t TimestampNs = 0;
 		std::uint32_t ThreadId = 0;
+		bool FromEngineEvent = false;
 		MemoryPayloadPreview Payload;
 	};
 
@@ -855,6 +934,12 @@ private:
 	{
 		MemoryPayloadPreview Preview;
 		Preview.OriginalBytes = Size;
+
+		if constexpr (!MemoryCompileEnableDebugGuards)
+		{
+			return Preview;
+		}
+
 		if (!Ptr || Size == 0 || PayloadPreviewBytes == 0)
 		{
 			return Preview;
@@ -900,7 +985,15 @@ private:
 		Record.Alignment = Alignment;
 		Record.AllocationId = AllocationId;
 		Record.ResourceId = ResourceId;
+		if (MaxTimelineEntries == 0)
+		{
+			return;
+		}
 		Timeline.push_back(std::move(Record));
+		if (Timeline.size() > MaxTimelineEntries)
+		{
+			Timeline.pop_front();
+		}
 	}
 
 	void addIssueLocked(
@@ -1016,6 +1109,12 @@ private:
 
 	void recordEngineEvent(const MemoryEvent& Event)
 	{
+		if constexpr (!isCompiledEnabled())
+		{
+			(void)Event;
+			return;
+		}
+
 		HookSuppressionScope Scope;
 		std::lock_guard Lock(Mutex);
 		++Statistics.EngineEventCount;
@@ -1049,6 +1148,23 @@ private:
 
 			if (Event.UserPtr)
 			{
+				auto Existing = ActiveAllocations.find(Event.UserPtr);
+				if (Existing != ActiveAllocations.end() && Existing->second.FromEngineEvent)
+				{
+					Existing->second.Size = Event.Size;
+					Existing->second.Alignment = Event.Alignment;
+					Existing->second.AllocationId = Event.AllocationId;
+					Existing->second.TimestampNs = Event.Timestamp;
+					Existing->second.ThreadId = threadIdFrom(Event.ThreadId);
+					Existing->second.FrameIndex = Event.FrameIndex;
+					Existing->second.ResourceId = Event.ResourceId;
+					Existing->second.FromThreadCache = Event.FromThreadCache;
+					Existing->second.FromCentralPool = Event.FromCentralPool;
+					Existing->second.FromOS = Event.FromOS;
+					FreedAllocations.erase(Event.UserPtr);
+					break;
+				}
+
 				ActiveAllocation Allocation;
 				Allocation.Operation = HookAllocationOp::Unknown;
 				Allocation.Size = Event.Size;
@@ -1069,10 +1185,36 @@ private:
 		}
 
 		case MemoryEventType::Deallocate:
+		{
+			std::size_t ReleasedSize = Event.Size;
+			if (Event.UserPtr)
+			{
+				auto ActiveIter = ActiveAllocations.find(Event.UserPtr);
+				if (ActiveIter != ActiveAllocations.end())
+				{
+					ReleasedSize = ActiveIter->second.Size;
+
+					FreedAllocation Freed;
+					Freed.Sequence = ++NextFreedSequence;
+					Freed.FreedBy = HookAllocationOp::Unknown;
+					Freed.Size = ActiveIter->second.Size;
+					Freed.Alignment = ActiveIter->second.Alignment;
+					Freed.TimestampNs = Event.Timestamp;
+					Freed.ThreadId = threadIdFrom(Event.ThreadId);
+					Freed.FromEngineEvent = true;
+					rememberFreedAllocationLocked(Event.UserPtr, Freed);
+					ActiveAllocations.erase(ActiveIter);
+				}
+				else
+				{
+					FreedAllocations.erase(Event.UserPtr);
+				}
+			}
+
 			++Statistics.DeallocateCount;
-			Statistics.TotalFreedBytes += Event.Size;
-			Statistics.CurrentLiveBytes = Statistics.CurrentLiveBytes >= Event.Size
-				? Statistics.CurrentLiveBytes - Event.Size
+			Statistics.TotalFreedBytes += ReleasedSize;
+			Statistics.CurrentLiveBytes = Statistics.CurrentLiveBytes >= ReleasedSize
+				? Statistics.CurrentLiveBytes - ReleasedSize
 				: 0;
 			if (Statistics.CurrentLiveBlocks > 0)
 			{
@@ -1082,11 +1224,8 @@ private:
 			{
 				++Statistics.OsReleaseCount;
 			}
-			if (Event.UserPtr)
-			{
-				ActiveAllocations.erase(Event.UserPtr);
-			}
 			break;
+		}
 
 		case MemoryEventType::ThreadCacheHit:
 			++Statistics.ThreadCacheHitCount;
@@ -1202,6 +1341,17 @@ private:
 		auto Existing = ActiveAllocations.find(Ptr);
 		if (Existing != ActiveAllocations.end())
 		{
+			if (Existing->second.FromEngineEvent)
+			{
+				if (Existing->second.Operation == HookAllocationOp::Unknown)
+				{
+					Existing->second.Operation = Operation;
+				}
+				FreedAllocations.erase(Ptr);
+				(void)Caller;
+				return;
+			}
+
 			++Statistics.DoubleAllocationCount;
 			addIssueLocked(
 				MemoryIssueType::DoubleAllocation,
@@ -1363,6 +1513,11 @@ private:
 				return;
 			}
 
+			if (Iter->second.FromEngineEvent)
+			{
+				return;
+			}
+
 			const std::size_t OldSize = Iter->second.Size;
 			Iter->second.Operation = HookAllocationOp::Realloc;
 			Iter->second.Size = NewSize;
@@ -1453,6 +1608,16 @@ private:
 		auto Existing = ActiveAllocations.find(Ptr);
 		if (Existing != ActiveAllocations.end())
 		{
+			if (Existing->second.FromEngineEvent)
+			{
+				if (Existing->second.Operation == HookAllocationOp::Unknown)
+				{
+					Existing->second.Operation = Operation;
+				}
+				FreedAllocations.erase(Ptr);
+				return;
+			}
+
 			++Statistics.DoubleAllocationCount;
 			addIssueLocked(
 				MemoryIssueType::DoubleAllocation,
@@ -1511,6 +1676,12 @@ private:
 			auto FreedIter = FreedAllocations.find(Ptr);
 			if (FreedIter != FreedAllocations.end())
 			{
+				if (FreedIter->second.FromEngineEvent)
+				{
+					FreedIter->second.FromEngineEvent = false;
+					return;
+				}
+
 				++Statistics.DoubleFreeCount;
 				addIssueLocked(
 					MemoryIssueType::DoubleFree,
@@ -1541,6 +1712,11 @@ private:
 		}
 
 		const ActiveAllocation Active = ActiveIter->second;
+		if (Active.FromEngineEvent)
+		{
+			return;
+		}
+
 		const HookAllocationOp Expected = expectedFreeOperation(Active.Operation);
 		if (Expected != HookAllocationOp::Unknown && Expected != Operation)
 		{
@@ -1606,6 +1782,7 @@ private:
 		Freed.Alignment = Active.Alignment;
 		Freed.TimestampNs = TimestampNs;
 		Freed.ThreadId = ThreadId;
+		Freed.FromEngineEvent = false;
 		Freed.Payload = Payload;
 		rememberFreedAllocationLocked(Ptr, Freed);
 
@@ -1617,12 +1794,13 @@ private:
 	std::unordered_map<void*, ActiveAllocation> ActiveAllocations;
 	std::unordered_map<void*, FreedAllocation> FreedAllocations;
 	std::deque<FreedOrderEntry> FreedOrder;
-	std::vector<TraceRecord> Timeline;
+	std::deque<TraceRecord> Timeline;
 	std::vector<MemoryIssueRecord> Issues;
 	MemoryTrackerStatistics Statistics;
 
 	std::size_t PayloadPreviewBytes = 32;
 	std::size_t FreedHistoryLimit = 8192;
+	std::size_t MaxTimelineEntries = MemoryTrackerDefaultMaxTimelineEntries;
 	std::uint64_t NextFreedSequence = 0;
 	std::atomic<bool> HookEnabled{false};
 };

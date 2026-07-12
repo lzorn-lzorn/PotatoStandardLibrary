@@ -156,9 +156,17 @@ void TestObserversAndLeakDetection(TestContext& context)
 	context.Expect(leak_count_before_free == 1, "leak detector should report one live allocation");
 	core::mem::AllocatorFacade::deallocate(leaked, 96, alignof(std::max_align_t), 13);
 	const auto snapshot = tracker.getStatistics();
-	context.Expect(snapshot.AllocateCount >= 2, "tracker should count allocation events");
-	context.Expect(snapshot.DeallocateCount >= 2, "tracker should count deallocation events");
-	context.Expect(tracker.getEventCount() > 0, "tracker should capture memory timeline events");
+	if constexpr (core::mem::MemoryTracker::isCompiledEnabled())
+	{
+		context.Expect(snapshot.AllocateCount >= 2, "tracker should count allocation events");
+		context.Expect(snapshot.DeallocateCount >= 2, "tracker should count deallocation events");
+		context.Expect(tracker.getEventCount() > 0, "tracker should capture memory timeline events");
+	}
+	else
+	{
+		context.Expect(snapshot.EngineEventCount == 0, "release tracker should not process engine events");
+		context.Expect(tracker.getEventCount() == 0, "release tracker should keep timeline empty");
+	}
 	const auto trace_path = std::filesystem::temp_directory_path() / "potato_memory_report_test.json";
 	const bool flushed = tracker.flushToFile(trace_path);
 	context.Expect(flushed, "tracker should flush JSON report file");
@@ -198,7 +206,8 @@ void TestDeallocateNullptr(TestContext& context)
 
 void TestUseAfterFreeDetection(TestContext& context)
 {
-#if !defined(NDEBUG) || defined(CORE_MEM_FORCE_DEBUG)
+	if constexpr (core::mem::MemoryCompileEnableUseAfterFreeDetection && core::mem::MemoryCompileEnableDebugGuards)
+	{
 	UseAfterFreeObserver observer;
 	core::mem::AllocatorFacade::bindObserver(observer);
 
@@ -213,14 +222,17 @@ void TestUseAfterFreeDetection(TestContext& context)
 	context.Expect(
 		observer.Count.load(std::memory_order_relaxed) > 0,
 		"use-after-free writes should be reported when deferred free is flushed");
-#else
-	context.Expect(true, "use-after-free test skipped in release mode");
-#endif
+	}
+	else
+	{
+		context.Expect(true, "use-after-free test skipped when compile-time UAF detection is disabled");
+	}
 }
 
 void TestQuarantineDoesNotDrainOnAllocate(TestContext& context)
 {
-#if !defined(NDEBUG) || defined(CORE_MEM_FORCE_DEBUG)
+	if constexpr (core::mem::MemoryCompileEnableUseAfterFreeDetection && core::mem::MemoryCompileEnableDebugGuards)
+	{
 	UseAfterFreeObserver observer;
 	core::mem::AllocatorFacade::bindObserver(observer);
 
@@ -242,9 +254,11 @@ void TestQuarantineDoesNotDrainOnAllocate(TestContext& context)
 		"quarantine should report use-after-free when explicitly flushed");
 
 	core::mem::AllocatorFacade::unbindObserver(observer);
-#else
-	context.Expect(true, "deterministic quarantine test skipped in release mode");
-#endif
+	}
+	else
+	{
+		context.Expect(true, "deterministic quarantine test skipped when compile-time UAF detection is disabled");
+	}
 }
 
 void TestPrewarmApi(TestContext& context)
@@ -267,11 +281,17 @@ void TestAllocatorStatsApi(TestContext& context)
 	core::mem::AllocatorFacade::flushDeferredFrees();
 	auto after_flush = core::mem::AllocatorFacade::getStats();
 
-	if constexpr (core::mem::MemoryDebugEnabled)
+	if constexpr (core::mem::MemoryCompileEnableUseAfterFreeDetection && core::mem::MemoryCompileEnableDebugGuards)
 	{
 		context.Expect(
 			before_flush.QuarantineEntryCount >= 1,
 			"stats API should expose quarantine entries before flush in debug path");
+	}
+	else
+	{
+		context.Expect(
+			before_flush.QuarantineEntryCount == 0,
+			"stats API should keep quarantine empty when compile-time UAF detection is disabled");
 	}
 
 	context.Expect(
@@ -442,6 +462,12 @@ void TestZeroSizeAllocationBehavior(TestContext& context)
 
 void TestHookIssueTracking(TestContext& context)
 {
+	if constexpr (!core::mem::MemoryTracker::isCompiledEnabled())
+	{
+		context.Expect(true, "hook issue tracking test skipped when tracker is compile-time disabled");
+		return;
+	}
+
 	auto& tracker = core::mem::MemoryTracker::global();
 	tracker.clear();
 	core::mem::MemoryTracker::setHookEnabled(true);
@@ -515,6 +541,91 @@ void TestHookIssueTracking(TestContext& context)
 		}
 	}
 	context.Expect(has_double_free_payload, "double free issue should contain payload preview bytes");
+	core::mem::MemoryTracker::setHookEnabled(false);
+	tracker.clear();
+}
+
+void TestTrackerEngineHookDedup(TestContext& context)
+{
+	if constexpr (!core::mem::MemoryTracker::isCompiledEnabled())
+	{
+		context.Expect(true, "engine/hook dedup test skipped when tracker is compile-time disabled");
+		return;
+	}
+
+	auto& tracker = core::mem::MemoryTracker::global();
+	tracker.clear();
+	core::mem::MemoryTracker::setHookEnabled(true);
+
+	std::array<std::uint8_t, 64> payload{};
+	void* ptr = payload.data();
+
+	core::mem::MemoryEvent alloc_event;
+	alloc_event.Type = core::mem::MemoryEventType::Allocate;
+	alloc_event.UserPtr = ptr;
+	alloc_event.Size = payload.size();
+	alloc_event.Alignment = alignof(std::max_align_t);
+	alloc_event.AllocationId = 1001;
+	alloc_event.Timestamp = core::mem::timestampNs();
+	alloc_event.ThreadId = std::this_thread::get_id();
+
+	core::mem::MemoryEvent free_event = alloc_event;
+	free_event.Type = core::mem::MemoryEventType::Deallocate;
+	free_event.Timestamp = core::mem::timestampNs();
+
+	tracker.onMemoryEvent(alloc_event);
+	core::mem::MemoryTracker::onHookAllocation(
+		core::mem::HookAllocationOp::Malloc,
+		ptr,
+		payload.size(),
+		core::mem::MemoryTrackerUnknownSize,
+		nullptr);
+	core::mem::MemoryTracker::onHookFree(
+		core::mem::HookAllocationOp::Free,
+		ptr,
+		core::mem::MemoryTrackerUnknownSize,
+		core::mem::MemoryTrackerUnknownSize,
+		nullptr);
+	tracker.onMemoryEvent(free_event);
+
+	const auto report = tracker.getReport();
+	context.Expect(report.Statistics.AllocateCount == 1, "engine allocate count should not be duplicated by hook path");
+	context.Expect(report.Statistics.DeallocateCount == 1, "engine deallocate count should not be duplicated by hook path");
+	context.Expect(report.Statistics.CurrentLiveBlocks == 0, "dedup path should leave zero live blocks");
+	context.Expect(report.Statistics.CurrentLiveBytes == 0, "dedup path should leave zero live bytes");
+	context.Expect(report.Statistics.DoubleAllocationCount == 0, "dedup path should not report false double allocation");
+	context.Expect(report.Statistics.DoubleFreeCount == 0, "dedup path should not report false double free");
+	context.Expect(report.Statistics.InvalidFreeCount == 0, "dedup path should not report false invalid free");
+
+	core::mem::MemoryTracker::setHookEnabled(false);
+	tracker.clear();
+}
+
+void TestTrackerTimelineCap(TestContext& context)
+{
+	if constexpr (!core::mem::MemoryTracker::isCompiledEnabled())
+	{
+		context.Expect(true, "timeline cap test skipped when tracker is compile-time disabled");
+		return;
+	}
+
+	auto& tracker = core::mem::MemoryTracker::global();
+	tracker.clear();
+	core::mem::MemoryTracker::setHookEnabled(true);
+	core::mem::MemoryTracker::setMaxTimelineEntries(8);
+
+	for (std::size_t i = 0; i < 32; ++i)
+	{
+		core::mem::MemoryTracker::onHookAllocationFailure(
+			core::mem::HookAllocationOp::Malloc,
+			16,
+			core::mem::MemoryTrackerUnknownSize,
+			reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1000 + i)));
+	}
+
+	context.Expect(tracker.getEventCount() == 8, "timeline should be capped to configured max entries");
+
+	core::mem::MemoryTracker::setMaxTimelineEntries(core::mem::MemoryTrackerDefaultMaxTimelineEntries);
 	core::mem::MemoryTracker::setHookEnabled(false);
 	tracker.clear();
 }
@@ -600,6 +711,8 @@ int main()
 	TestNoThrowAllocationBehavior(context);
 	TestZeroSizeAllocationBehavior(context);
 	TestHookIssueTracking(context);
+	TestTrackerEngineHookDedup(context);
+	TestTrackerTimelineCap(context);
 	BenchmarkLargeAllocation(context);
 	BenchmarkHighFrequencyAllocation(context);
 	core::mem::AllocatorFacade::onThreadExit();

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <ostream>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -30,34 +31,34 @@ public:
 	/**
 	 * @brief Consume allocator events and maintain live-allocation map.
 	 * @param
-	 *     - event  const MemoryEvent&  Event emitted by allocator pipeline.
+	 *     - Event  const MemoryEvent&  Event emitted by allocator pipeline.
 	 * @usage
 	 *     - Bind this observer when leak-tracking is required.
 	 * @return
 	 *     - void
 	 */
-	void onMemoryEvent(const MemoryEvent& event)
+	void onMemoryEvent(const MemoryEvent& Event)
 	{
-		if (event.Type == MemoryEventType::Allocate)
+		if (Event.Type == MemoryEventType::Allocate)
 		{
-			LeakRecord record;
-			record.Size = event.Size;
-			record.Alignment = event.Alignment;
-			record.AllocationId = event.AllocationId;
-			record.Timestamp = event.Timestamp;
-			record.FrameIndex = event.FrameIndex;
-			record.ResourceId = event.ResourceId;
-			record.ThreadId = event.ThreadId;
+			LeakRecord Record;
+			Record.Size = Event.Size;
+			Record.Alignment = Event.Alignment;
+			Record.AllocationId = Event.AllocationId;
+			Record.Timestamp = Event.Timestamp;
+			Record.FrameIndex = Event.FrameIndex;
+			Record.ResourceId = Event.ResourceId;
+			Record.ThreadId = Event.ThreadId;
 
-			std::lock_guard lock(Mutex);
-			LiveAllocations[event.UserPtr] = record;
+			std::lock_guard Lock(Mutex);
+			LiveAllocations[Event.UserPtr] = Record;
 			return;
 		}
 
-		if (event.Type == MemoryEventType::Deallocate)
+		if (Event.Type == MemoryEventType::Deallocate)
 		{
-			std::lock_guard lock(Mutex);
-			LiveAllocations.erase(event.UserPtr);
+			std::lock_guard Lock(Mutex);
+			LiveAllocations.erase(Event.UserPtr);
 		}
 	}
 
@@ -68,11 +69,11 @@ public:
 	 * @usage
 	 *     - Useful before shutdown assertion.
 	 * @return
-	 *     - bool  true if no leak record exists.
+	 *     - bool  true if no leak Record exists.
 	 */
 	[[nodiscard]] bool isEmpty() const
 	{
-		std::lock_guard lock(Mutex);
+		std::lock_guard Lock(Mutex);
 		return LiveAllocations.empty();
 	}
 
@@ -83,11 +84,11 @@ public:
 	 * @usage
 	 *     - Use in leak report summary output.
 	 * @return
-	 *     - std::size_t  Live allocation record count.
+	 *     - std::size_t  Live allocation Record count.
 	 */
 	[[nodiscard]] std::size_t getLeakCount() const
 	{
-		std::lock_guard lock(Mutex);
+		std::lock_guard Lock(Mutex);
 		return LiveAllocations.size();
 	}
 
@@ -102,14 +103,47 @@ public:
 	 */
 	[[nodiscard]] std::vector<std::pair<void*, LeakRecord>> getLeakSnapshot() const
 	{
-		std::lock_guard lock(Mutex);
-		std::vector<std::pair<void*, LeakRecord>> leaks;
-		leaks.reserve(LiveAllocations.size());
-		for (const auto& [ptr, record] : LiveAllocations)
+		std::lock_guard Lock(Mutex);
+		std::vector<std::pair<void*, LeakRecord>> Leaks;
+		Leaks.reserve(LiveAllocations.size());
+		for (const auto& [ptr, Record] : LiveAllocations)
 		{
-			leaks.emplace_back(ptr, record);
+			Leaks.emplace_back(ptr, Record);
 		}
-		return leaks;
+		return Leaks;
+	}
+
+	/**
+	 * @brief Print current unresolved leaks into output stream.
+	 * @param
+	 *     - Output  std::ostream&  Target stream for textual leak report.
+	 * @usage
+	 *     - Call explicitly on shutdown boundary instead of relying on destructors.
+	 * @return
+	 *     - bool  true when leaks are present and printed.
+	 */
+	[[nodiscard]] bool reportLeaks(std::ostream& Output) const
+	{
+		const auto Leaks = getLeakSnapshot();
+		if (Leaks.empty())
+		{
+			Output << "[MemoryLeakDetector] no live allocations.\n";
+			return false;
+		}
+
+		Output << "[MemoryLeakDetector] unresolved allocations=" << Leaks.size() << "\n";
+		for (const auto& [Ptr, Record] : Leaks)
+		{
+			Output << "  ptr=" << Ptr
+				<< " size=" << Record.Size
+				<< " align=" << Record.Alignment
+				<< " allocId=" << Record.AllocationId
+				<< " frame=" << Record.FrameIndex
+				<< " resource=" << Record.ResourceId
+				<< "\n";
+		}
+
+		return true;
 	}
 
 private:

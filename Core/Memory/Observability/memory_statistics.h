@@ -132,28 +132,28 @@ public:
 	 */
 	[[nodiscard]] MemoryStatisticsSnapshot getSnapshot() const noexcept
 	{
-		MemoryStatisticsSnapshot value;
-		value.AllocateCount = AllocateCount.load(std::memory_order_relaxed);
-		value.DeallocateCount = DeallocateCount.load(std::memory_order_relaxed);
-		value.ThreadCacheHitCount = ThreadCacheHitCount.load(std::memory_order_relaxed);
-		value.ThreadCacheMissCount = ThreadCacheMissCount.load(std::memory_order_relaxed);
-		value.CentralFetchCount = CentralFetchCount.load(std::memory_order_relaxed);
-		value.CentralReturnCount = CentralReturnCount.load(std::memory_order_relaxed);
-		value.OsAllocateCount = OsAllocateCount.load(std::memory_order_relaxed);
-		value.OsReleaseCount = OsReleaseCount.load(std::memory_order_relaxed);
-		value.GuardCorruptionCount = GuardCorruptionCount.load(std::memory_order_relaxed);
-		value.UseAfterFreeCount = UseAfterFreeCount.load(std::memory_order_relaxed);
-		value.CurrentBytes = CurrentBytes.load(std::memory_order_relaxed);
-		value.PeakBytes = PeakBytes.load(std::memory_order_relaxed);
-		return value;
+		MemoryStatisticsSnapshot Value;
+		Value.AllocateCount = AllocateCount.load(std::memory_order_relaxed);
+		Value.DeallocateCount = DeallocateCount.load(std::memory_order_relaxed);
+		Value.ThreadCacheHitCount = ThreadCacheHitCount.load(std::memory_order_relaxed);
+		Value.ThreadCacheMissCount = ThreadCacheMissCount.load(std::memory_order_relaxed);
+		Value.CentralFetchCount = CentralFetchCount.load(std::memory_order_relaxed);
+		Value.CentralReturnCount = CentralReturnCount.load(std::memory_order_relaxed);
+		Value.OsAllocateCount = OsAllocateCount.load(std::memory_order_relaxed);
+		Value.OsReleaseCount = OsReleaseCount.load(std::memory_order_relaxed);
+		Value.GuardCorruptionCount = GuardCorruptionCount.load(std::memory_order_relaxed);
+		Value.UseAfterFreeCount = UseAfterFreeCount.load(std::memory_order_relaxed);
+		Value.CurrentBytes = CurrentBytes.load(std::memory_order_relaxed);
+		Value.PeakBytes = PeakBytes.load(std::memory_order_relaxed);
+		return Value;
 	}
 
 private:
 	void updatePeak() noexcept
 	{
-		std::size_t current = CurrentBytes.load(std::memory_order_relaxed);
+		std::size_t Current = CurrentBytes.load(std::memory_order_relaxed);
 		std::size_t peak = PeakBytes.load(std::memory_order_relaxed);
-		while (current > peak && !PeakBytes.compare_exchange_weak(peak, current, std::memory_order_relaxed))
+		while (Current > peak && !PeakBytes.compare_exchange_weak(peak, Current, std::memory_order_relaxed))
 		{
 		}
 	}

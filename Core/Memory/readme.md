@@ -176,6 +176,154 @@ User API (AllocatorFacade / EngineAllocator / EngineMemoryResource)
 
 观测模块只依赖事件总线，不参与分配决策。
 
+### 8.1 组件总览（Memory/Observability）
+
+- `memory_observability.h`
+  - 统一入口头文件，聚合：`memory_tracker.h`、`memory_leak_detector.h`、`memory_statistics.h`、`new_malloc_tracker.h`
+- `memory_statistics.h`
+  - `MemoryStatisticsObserver`：事件计数器（Allocate/Deallocate/ThreadCache/CentralPool/UAF/Guard）
+  - `MemoryStatisticsSnapshot`：统计快照
+  - `AllocatorRuntimeStatsSnapshot`：运行时池状态结构（`AllocatorFacade::getStats()` 返回）
+- `memory_leak_detector.h`
+  - `MemoryLeakDetectorObserver`：维护 live allocation 映射
+  - `LeakRecord`：泄漏项元数据
+- `memory_tracker.h`
+  - `MemoryTracker`：深度诊断跟踪器（事件轨迹、问题检测、live snapshot、报告导出）
+  - `MemoryTrackerReport` / `MemoryTrackerStatistics`：报告结构
+  - `JsonMemoryTrackerReportBackend` / `IMemoryTrackerReportBackend`：报告后端扩展点
+- `new_malloc_tracker.h/.cpp`
+  - 全局 `new/delete/malloc/realloc` hook 兼容层，向 `MemoryTracker` 回灌 hook 事件
+
+### 8.2 快速接入（推荐）
+
+```cpp
+#include <Core/Memory/memory_facade.h>
+#include <Core/Memory/Observability/memory_observability.h>
+
+core::mem::MemoryStatisticsObserver statsObserver;
+core::mem::MemoryLeakDetectorObserver leakObserver;
+auto& tracker = core::mem::MemoryTracker::global();
+
+core::mem::AllocatorFacade::bindObserver(statsObserver);
+core::mem::AllocatorFacade::bindObserver(leakObserver);
+if constexpr (core::mem::MemoryTracker::isCompiledEnabled()) {
+  core::mem::AllocatorFacade::bindObserver(tracker);
+}
+
+// ... 正常分配/释放 ...
+
+if constexpr (core::mem::MemoryTracker::isCompiledEnabled()) {
+  core::mem::AllocatorFacade::unbindObserver(tracker);
+}
+core::mem::AllocatorFacade::unbindObserver(leakObserver);
+core::mem::AllocatorFacade::unbindObserver(statsObserver);
+```
+
+### 8.3 `MemoryStatisticsObserver` 详细用法
+
+典型用途：HUD 面板、周期性 telemetry、benchmark 辅助指标。
+
+```cpp
+core::mem::MemoryStatisticsObserver statsObserver;
+core::mem::AllocatorFacade::bindObserver(statsObserver);
+
+// 运行一段 workload 后采样
+const auto snap = statsObserver.getSnapshot();
+// snap.AllocateCount / snap.ThreadCacheHitCount / snap.PeakBytes ...
+
+// 池/索引运行时健康状态（pull 模型）
+const auto runtime = core::mem::AllocatorFacade::getStats();
+// runtime.PageToSpanLevel1UsageRatio / runtime.RegionIndexLevel2UsageRatio ...
+```
+
+说明：
+
+- `getSnapshot()` 是事件累计视角。
+- `AllocatorFacade::getStats()` 是内部状态快照视角。
+- 两者配合可以区分“行为频次问题”和“池容量/碎片问题”。
+
+### 8.4 `MemoryLeakDetectorObserver` 详细用法
+
+典型用途：关卡切换后做泄漏检查、进程退出前断言清理。
+
+```cpp
+core::mem::MemoryLeakDetectorObserver leakObserver;
+core::mem::AllocatorFacade::bindObserver(leakObserver);
+
+// ... 场景运行 ...
+
+if (!leakObserver.isEmpty()) {
+    const auto leaks = leakObserver.getLeakSnapshot();
+    // 遍历 leaks: (ptr, LeakRecord)
+  leakObserver.reportLeaks(std::cerr); // 退出前显式输出
+}
+```
+
+说明：
+
+- 该组件只追踪 allocator 事件中的 `Allocate/Deallocate`。
+- `getLeakSnapshot()` 返回稳定拷贝，适合离线输出。
+- `reportLeaks(std::ostream&)` 可在 shutdown/atexit 边界显式导出，避免只依赖析构时机。
+
+### 8.5 `MemoryTracker` 详细用法
+
+典型用途：问题诊断（double free / invalid free / mismatch / guard / UAF）、自动化测试报告、线上故障回放。
+
+```cpp
+auto& tracker = core::mem::MemoryTracker::global();
+if constexpr (core::mem::MemoryTracker::isCompiledEnabled()) {
+  core::mem::AllocatorFacade::bindObserver(tracker);
+}
+
+// 可选：hook 参数
+core::mem::MemoryTracker::setHookEnabled(true);
+core::mem::MemoryTracker::setPayloadPreviewBytes(32);
+core::mem::MemoryTracker::setFreedHistoryLimit(4096);
+core::mem::MemoryTracker::setMaxTimelineEntries(10000);
+
+// ... workload ...
+
+const auto stats = tracker.getStatistics();
+const auto report = tracker.getReport();
+tracker.flushToFile("memory_report.json");
+```
+
+关键 API：
+
+- `isCompiledEnabled()`：编译期开关（当 `MemoryCompileEnableDebugGuards=false` 时，Tracker 自动降级为 no-op）
+- `setHookEnabled(bool)`：开启/关闭 hook 事件采集（默认建议关闭，仅诊断阶段开启）
+- `setMaxTimelineEntries(size_t)`：限制 timeline 最大条目，防止长时间运行内存持续增长
+- `getStatistics()`：快速统计视图
+- `getReport()`：完整快照（timeline/issues/live allocations）
+- `flushToFile(path)`：JSON 输出
+- `clear()`：清空当前跟踪状态
+
+行为约束：
+
+- 当 `MemoryCompileEnableDebugGuards` 关闭时：`MemoryTracker` 的 Engine/Hook 入口会直接 no-op，避免 Release 下误绑定造成热路径退化。
+- Hook 与 Engine 双轨同时上报同一指针时，Tracker 会优先保留 Engine 轨迹，避免重复计数和误报 invalid/double free。
+
+### 8.6 `new_malloc_tracker`（Hook 层）用法
+
+说明：
+
+- Hook 实现在 `new_malloc_tracker.cpp`，由 Core 模块构建时自动编译。
+- 运行期是否记录 hook 数据由 `MemoryTracker::setHookEnabled(bool)` 控制。
+- `new_malloc_tracker.h` 提供兼容别名（`LegacyAllocOp`、`LegacyUnknownSize`）和返回地址宏（`CORE_MEM_HOOK_RETURN_ADDRESS`）。
+- Windows 下不重载 `malloc/free`（仅跟踪 `new/delete`），这是为了避免 UCRT 符号冲突。
+
+建议：
+
+- 仅在排查问题时开启 hook，避免长期性能开销。
+- 开启 hook 时优先同时绑定 `MemoryTracker`，否则 hook 事件不会进入可读报告。
+
+### 8.7 推荐工作流
+
+1. 常态运行：绑定 `MemoryStatisticsObserver`，低开销看趋势。
+2. 关卡/模块边界：绑定 `MemoryLeakDetectorObserver` 做 leak gate。
+3. 问题定位：临时绑定 `MemoryTracker`，开启 hook，导出 JSON 报告。
+4. 定位完成：`setHookEnabled(false)`，解绑重型 observer，恢复低开销模式。
+
 ## 9. 与 STL / PMR 集成
 
 - `EngineAllocator<T>`：用于 `std::vector/std::map/...`

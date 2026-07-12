@@ -207,11 +207,11 @@ public:
 			SpanObj->IsInPartialList = true;
 		}
 
-		std::uint32_t allocated = 0;
-		while (allocated < MaxBlocks && SpanObj->FreeList)
+		std::uint32_t Allocated = 0;
+		while (Allocated < MaxBlocks && SpanObj->FreeList)
 		{
-			OutBlocks[allocated] = popBlock(SpanObj->FreeList);
-			++allocated;
+			OutBlocks[Allocated] = popBlock(SpanObj->FreeList);
+			++Allocated;
 			--SpanObj->FreeBlocks;
 		}
 
@@ -221,7 +221,7 @@ public:
 			SpanObj->IsInPartialList = false;
 		}
 
-		return allocated;
+		return Allocated;
 	}
 
 	/**

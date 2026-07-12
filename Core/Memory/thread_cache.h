@@ -77,7 +77,7 @@ public:
 			refillFromDeferred(SizeClassIndex, BlockSize);
 		}
 
-		if (FreeList.Head)
+		if (FreeList.Head) [[likely]]
 		{
 			void* Block = popBlock(FreeList.Head);
 			--FreeList.Count;
