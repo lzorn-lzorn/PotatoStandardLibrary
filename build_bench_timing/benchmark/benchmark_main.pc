@@ -1,0 +1,9 @@
+prefix=C:/Program Files (x86)/PotatoStandardLibrary
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+
+Name: benchmark
+Description: Google microbenchmark framework (with main() function)
+Version: 1.9.5.97
+Requires: benchmark
+Libs: -L${libdir} -lbenchmark_main

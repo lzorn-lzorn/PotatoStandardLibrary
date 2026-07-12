@@ -171,6 +171,8 @@ public:
 		const std::uint32_t MaxBlocks,
 		Span** OutSpanHint = nullptr)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::CentralPoolFetchBatch, SizeClassIndex);
+
 		if (SizeClassIndex >= NumSizeClasses || !OutBlocks || MaxBlocks == 0)
 		{
 			return 0;
@@ -254,6 +256,8 @@ public:
 		const std::uint32_t Count,
 		Span* InitialHint = nullptr)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::CentralPoolReturnBatch, SizeClassIndex);
+
 		if (SizeClassIndex >= NumSizeClasses || !Head || Count == 0)
 		{
 			return;
@@ -765,6 +769,8 @@ private:
 
 	[[nodiscard]] bool registerSpanPages(Span& InSpan)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::CentralSpanRegisterPages, InSpan.SizeClassIndex);
+
 		if (!InSpan.BackingSpan.isValid())
 		{
 			return false;
@@ -802,6 +808,8 @@ private:
 
 	void unregisterSpanPages(const Span& InSpan)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::CentralSpanUnregisterPages, InSpan.SizeClassIndex);
+
 		if (!InSpan.BackingSpan.isValid())
 		{
 			return;

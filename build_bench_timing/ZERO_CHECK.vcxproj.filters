@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="E:\Code\PotatoStandardLibrary\build_bench_timing\CMakeFiles\dcf5e7d1476d83494f6b262323acf623\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{7F563CE1-B071-33A0-9254-9AA9DFB22E8B}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

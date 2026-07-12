@@ -108,6 +108,41 @@ On thread exit, `ThreadCacheRegistry::onThreadExit()` flushes the remaining loca
 - Dedicated regions keep large or non-standard requests out of the small-object machinery.
 - Debug guards and quarantine stay outside the fast path unless explicitly enabled.
 
+## Internal allocator benchmark timing (compile-time switch)
+
+The allocator supports an internal timing/benchmark mode intended for hotspot diagnosis under concurrency.
+
+- CMake option: `POTATO_MEMORY_INTERNAL_BENCH_TIMING` (default `OFF`)
+- Compile macro: `CORE_MEM_CFG_ENABLE_INTERNAL_BENCH_TIMING` (`0/1`), propagated on target `Core`
+- Output prefix: `[MEM-BENCH]`
+
+When the option is `OFF`, benchmark structures and timing scopes are compiled out by preprocessor guards.
+When the option is `ON`, internal counters are enabled and periodic summaries are printed.
+
+### Fine-grained timing points currently covered
+
+- Engine: `engine.allocate`, `engine.deallocate`
+- Quarantine: `quarantine.enqueue`, `quarantine.drain`, `quarantine.release_entry`
+- Dedicated cache: `dedicated_cache.acquire_hit`, `dedicated_cache.acquire_miss`, `dedicated_cache.recycle`
+- Thread cache: `thread_cache.allocate`, `thread_cache.deallocate`, `thread_cache.refill_deferred`, `thread_cache.spill_deferred`, `thread_cache.drain_deferred`, `thread_cache.trim_to_budget`
+- Central pool: `central_pool.fetch_batch`, `central_pool.return_batch`, `central_pool.register_span_pages`, `central_pool.unregister_span_pages`
+- Page allocator: `page_allocator.acquire_span`, `page_allocator.release_span`
+
+### Grouped statistics
+
+Internal summaries include grouped counters in addition to per-point totals:
+
+- Thread grouped counters: hash-bucketed thread groups (`[thread-bucket]`)
+- Size-class grouped counters: per-size-class groups where size-class context is available (`[size-class]`)
+
+This grouping is also controlled by `POTATO_MEMORY_INTERNAL_BENCH_TIMING` and is not active in normal builds.
+
+### Example configure command
+
+```powershell
+cmake -S . -B build_bench_timing -DPOTATO_STANDARD_BUILD_TESTS=ON -DBUILD_TESTING=ON -DPOTATO_MEMORY_INTERNAL_BENCH_TIMING=ON
+```
+
 ## Detailed modular configuration flow
 
 ### 1. Prerequisites

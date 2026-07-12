@@ -76,6 +76,8 @@ public:
 	template <AllocationLifetime Lifetime>
 	[[nodiscard]] void* allocateWithLifetime(const AllocationDescriptor& Descriptor)
 	{
+		CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::EngineAllocate);
+
 		if (Descriptor.Size == 0) [[unlikely]]
 		{
 			return getZeroSizeAllocationPointer();
@@ -114,6 +116,8 @@ public:
 	template <AllocationLifetime Lifetime>
 	void deallocateWithLifetime(void* Ptr, const AllocationDescriptor& Descriptor) noexcept
 	{
+		CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::EngineDeallocate);
+
 		if (!Ptr || isZeroSizeAllocationPointer(Ptr))
 		{
 			return;
@@ -170,6 +174,10 @@ public:
 	{
 		flushQuarantine();
 		ThreadCacheRegistry::onThreadExit();
+		if constexpr (MemoryCompileEnableInternalBenchTiming)
+		{
+			memoryBenchPrintSummary();
+		}
 	}
 
 	[[nodiscard]] std::size_t prewarm(const std::vector<MemoryPrewarmRequest>& Requests)
@@ -798,6 +806,8 @@ private:
 	template <AllocationLifetime Lifetime>
 	void enqueueSmallBlockQuarantine(const AllocationContext& Context)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::QuarantineEnqueue, Context.Layout.SizeClassIndex);
+
 		SmallBlockQuarantineEntry Entry;
 		Entry.RawPtr = Context.Runtime.RawPtr;
 		Entry.UserOffset = Context.Layout.UserOffset;
@@ -841,6 +851,8 @@ private:
 
 	void drainQuarantineShard(QuarantineShard& Shard, const bool ForceAll)
 	{
+		CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::QuarantineDrain);
+
 		const std::size_t ByteLimit = quarantineByteLimitPerShard();
 		const std::size_t EntryLimit = quarantineEntryLimitPerShard();
 
@@ -872,6 +884,8 @@ private:
 
 	void releaseSingleQuarantineEntry(const SmallBlockQuarantineEntry& Entry)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::QuarantineReleaseEntry, Entry.SizeClassIndex);
+
 		if (!isQuarantinePatternIntact(Entry))
 		{
 			emitUseAfterFree(Entry);
@@ -944,6 +958,8 @@ private:
 
 					if (Bucket.SizeKey == Bytes && Bucket.Count > 0)
 					{
+						CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::DedicatedCacheAcquireHit);
+
 						VirtualRegion Region = Bucket.Regions[Bucket.Count - 1];
 						Bucket.Regions[Bucket.Count - 1] = {};
 						--Bucket.Count;
@@ -959,10 +975,8 @@ private:
 			}
 		}
 
-		return VirtualMemoryManager::reserve(
-			Bytes,
-			Config.EnableHugePage,
-			Config.PreferredNumaNode);
+		CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::DedicatedCacheAcquireMiss);
+		return VirtualMemoryManager::reserve(Bytes, Config.EnableHugePage, Config.PreferredNumaNode);
 	}
 
 	void releaseDedicatedRegion(VirtualRegion& Region, const AllocationLifetime Lifetime) noexcept
@@ -1009,6 +1023,8 @@ private:
 				{
 					break;
 				}
+
+				CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::DedicatedCacheRecycle);
 
 				VirtualMemoryManager::decommit(Region, 0, Region.ReservedSize);
 				Bucket.Regions[Bucket.Count++] = Region;

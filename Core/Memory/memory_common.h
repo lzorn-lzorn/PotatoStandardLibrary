@@ -8,6 +8,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -55,12 +56,18 @@ inline constexpr bool MemoryDebugEnabled =
 #define CORE_MEM_CFG_LAZY_COMMIT 1
 #endif
 
+#ifndef CORE_MEM_CFG_ENABLE_INTERNAL_BENCH_TIMING
+#define CORE_MEM_CFG_ENABLE_INTERNAL_BENCH_TIMING 0
+#endif
+
 inline constexpr bool MemoryCompileEnableDebugGuards = CORE_MEM_CFG_ENABLE_DEBUG_GUARDS != 0;
 inline constexpr bool MemoryCompileEnableUseAfterFreeDetection = CORE_MEM_CFG_ENABLE_UAF_DETECTION != 0;
 inline constexpr bool MemoryCompileCaptureStack = CORE_MEM_CFG_CAPTURE_STACK != 0;
 inline constexpr bool MemoryCompileQuarantineReleaseOnlyOnFlush =
 	CORE_MEM_CFG_QUARANTINE_RELEASE_ONLY_ON_FLUSH != 0;
 inline constexpr bool MemoryCompileLazyCommit = CORE_MEM_CFG_LAZY_COMMIT != 0;
+inline constexpr bool MemoryCompileEnableInternalBenchTiming =
+	CORE_MEM_CFG_ENABLE_INTERNAL_BENCH_TIMING != 0;
 
 inline constexpr std::uint8_t AllocatedPattern = 0xCD;
 inline constexpr std::uint8_t FreedPattern = 0xDD;
@@ -141,6 +148,16 @@ namespace tuning
 	// dedicated 元数据节点池每次扩容的节点数。
 	inline constexpr std::size_t MemoryFacadeDedicatedNodeChunkSize = 256;
 
+	// -------------------- Internal Benchmark 参数 --------------------
+	// 内部计时统计每累积多少次采样打印一次摘要。
+	inline constexpr std::size_t MemoryBenchPrintEverySamples = 200000;
+	// 线程分组统计桶数（按线程哈希分桶）。
+	inline constexpr std::size_t MemoryBenchThreadGroupBucketCount = 64;
+	// size-class 分组统计桶数（覆盖当前 56 个 class 并预留扩展）。
+	inline constexpr std::size_t MemoryBenchSizeClassGroupBucketCount = 64;
+	// 每个点位打印的线程分组 TopN（按调用次数）。
+	inline constexpr std::size_t MemoryBenchPrintTopThreadGroups = 4;
+
 	// -------------------- PageAllocator 参数 --------------------
 	// 页分配器分片上限（与 CentralPool 对齐到 64）。
 	inline constexpr std::size_t PageAllocatorMaxShardCount = 64;
@@ -178,6 +195,350 @@ namespace tuning
 	return static_cast<std::uint64_t>(
 		std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count());
 }
+
+enum class MemoryBenchPoint : std::uint8_t
+{
+	EngineAllocate = 0,
+	EngineDeallocate,
+	QuarantineEnqueue,
+	QuarantineDrain,
+	QuarantineReleaseEntry,
+	DedicatedCacheAcquireHit,
+	DedicatedCacheAcquireMiss,
+	DedicatedCacheRecycle,
+	ThreadCacheAllocate,
+	ThreadCacheDeallocate,
+	ThreadCacheRefillDeferred,
+	ThreadCacheSpillDeferred,
+	ThreadCacheDrainDeferred,
+	ThreadCacheTrimToBudget,
+	CentralPoolFetchBatch,
+	CentralPoolReturnBatch,
+	CentralSpanRegisterPages,
+	CentralSpanUnregisterPages,
+	PageAllocatorAcquireSpan,
+	PageAllocatorReleaseSpan,
+	Count
+};
+
+#if CORE_MEM_CFG_ENABLE_INTERNAL_BENCH_TIMING
+struct MemoryBenchCounter
+{
+	std::atomic<std::uint64_t> Calls = 0;
+	std::atomic<std::uint64_t> TotalNs = 0;
+	std::atomic<std::uint64_t> MaxNs = 0;
+};
+
+[[nodiscard]] inline std::array<MemoryBenchCounter, static_cast<std::size_t>(MemoryBenchPoint::Count)>&
+memoryBenchCounters() noexcept
+{
+	static std::array<MemoryBenchCounter, static_cast<std::size_t>(MemoryBenchPoint::Count)> Counters{};
+	return Counters;
+}
+
+[[nodiscard]] inline std::array<
+	std::array<MemoryBenchCounter, tuning::MemoryBenchThreadGroupBucketCount>,
+	static_cast<std::size_t>(MemoryBenchPoint::Count)>&
+memoryBenchThreadGroupCounters() noexcept
+{
+	static std::array<
+		std::array<MemoryBenchCounter, tuning::MemoryBenchThreadGroupBucketCount>,
+		static_cast<std::size_t>(MemoryBenchPoint::Count)> Counters{};
+	return Counters;
+}
+
+[[nodiscard]] inline std::array<
+	std::array<MemoryBenchCounter, tuning::MemoryBenchSizeClassGroupBucketCount>,
+	static_cast<std::size_t>(MemoryBenchPoint::Count)>&
+memoryBenchSizeClassGroupCounters() noexcept
+{
+	static std::array<
+		std::array<MemoryBenchCounter, tuning::MemoryBenchSizeClassGroupBucketCount>,
+		static_cast<std::size_t>(MemoryBenchPoint::Count)> Counters{};
+	return Counters;
+}
+
+[[nodiscard]] inline std::atomic<std::uint64_t>& memoryBenchSampleCounter() noexcept
+{
+	static std::atomic<std::uint64_t> Counter = 0;
+	return Counter;
+}
+
+[[nodiscard]] inline std::size_t memoryBenchPointIndex(const MemoryBenchPoint Point) noexcept
+{
+	return static_cast<std::size_t>(Point);
+}
+
+[[nodiscard]] inline std::size_t memoryBenchThreadBucketForCurrentThread() noexcept
+{
+	thread_local const std::size_t ThreadHash =
+		static_cast<std::size_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+	return ThreadHash % tuning::MemoryBenchThreadGroupBucketCount;
+}
+
+inline void memoryBenchUpdateCounter(MemoryBenchCounter& Counter, const std::uint64_t ElapsedNs) noexcept
+{
+	Counter.Calls.fetch_add(1, std::memory_order_relaxed);
+	Counter.TotalNs.fetch_add(ElapsedNs, std::memory_order_relaxed);
+
+	std::uint64_t Max = Counter.MaxNs.load(std::memory_order_relaxed);
+	while (Max < ElapsedNs &&
+		!Counter.MaxNs.compare_exchange_weak(Max, ElapsedNs, std::memory_order_relaxed, std::memory_order_relaxed))
+	{
+	}
+}
+
+inline void memoryBenchPrintCounterLine(
+	const char* Prefix,
+	const char* Name,
+	const std::uint64_t Calls,
+	const std::uint64_t TotalNs,
+	const std::uint64_t MaxNs) noexcept
+{
+	if (Calls == 0)
+	{
+		return;
+	}
+
+	const double AvgNs = static_cast<double>(TotalNs) / static_cast<double>(Calls);
+	const double TotalMs = static_cast<double>(TotalNs) / 1000000.0;
+	std::printf(
+		"[MEM-BENCH] %s %-30s calls=%llu total_ms=%.3f avg_ns=%.1f max_ns=%llu\n",
+		Prefix,
+		Name,
+		static_cast<unsigned long long>(Calls),
+		TotalMs,
+		AvgNs,
+		static_cast<unsigned long long>(MaxNs));
+}
+
+[[nodiscard]] inline const char* memoryBenchPointName(const MemoryBenchPoint Point) noexcept
+{
+	switch (Point)
+	{
+	case MemoryBenchPoint::EngineAllocate:
+		return "engine.allocate";
+	case MemoryBenchPoint::EngineDeallocate:
+		return "engine.deallocate";
+	case MemoryBenchPoint::QuarantineEnqueue:
+		return "quarantine.enqueue";
+	case MemoryBenchPoint::QuarantineDrain:
+		return "quarantine.drain";
+	case MemoryBenchPoint::QuarantineReleaseEntry:
+		return "quarantine.release_entry";
+	case MemoryBenchPoint::DedicatedCacheAcquireHit:
+		return "dedicated_cache.acquire_hit";
+	case MemoryBenchPoint::DedicatedCacheAcquireMiss:
+		return "dedicated_cache.acquire_miss";
+	case MemoryBenchPoint::DedicatedCacheRecycle:
+		return "dedicated_cache.recycle";
+	case MemoryBenchPoint::ThreadCacheAllocate:
+		return "thread_cache.allocate";
+	case MemoryBenchPoint::ThreadCacheDeallocate:
+		return "thread_cache.deallocate";
+	case MemoryBenchPoint::ThreadCacheRefillDeferred:
+		return "thread_cache.refill_deferred";
+	case MemoryBenchPoint::ThreadCacheSpillDeferred:
+		return "thread_cache.spill_deferred";
+	case MemoryBenchPoint::ThreadCacheDrainDeferred:
+		return "thread_cache.drain_deferred";
+	case MemoryBenchPoint::ThreadCacheTrimToBudget:
+		return "thread_cache.trim_to_budget";
+	case MemoryBenchPoint::CentralPoolFetchBatch:
+		return "central_pool.fetch_batch";
+	case MemoryBenchPoint::CentralPoolReturnBatch:
+		return "central_pool.return_batch";
+	case MemoryBenchPoint::CentralSpanRegisterPages:
+		return "central_pool.register_span_pages";
+	case MemoryBenchPoint::CentralSpanUnregisterPages:
+		return "central_pool.unregister_span_pages";
+	case MemoryBenchPoint::PageAllocatorAcquireSpan:
+		return "page_allocator.acquire_span";
+	case MemoryBenchPoint::PageAllocatorReleaseSpan:
+		return "page_allocator.release_span";
+	default:
+		return "unknown";
+	}
+}
+
+inline void memoryBenchPrintSummary() noexcept
+{
+	static std::mutex PrintMutex;
+	std::unique_lock<std::mutex> Lock(PrintMutex, std::try_to_lock);
+	if (!Lock.owns_lock())
+	{
+		return;
+	}
+
+	auto& Counters = memoryBenchCounters();
+	auto& ThreadCounters = memoryBenchThreadGroupCounters();
+	auto& SizeClassCounters = memoryBenchSizeClassGroupCounters();
+	std::printf("[MEM-BENCH] -------- allocator timing summary --------\n");
+	for (std::size_t I = 0; I < Counters.size(); ++I)
+	{
+		const std::uint64_t Calls = Counters[I].Calls.load(std::memory_order_relaxed);
+		if (Calls == 0)
+		{
+			continue;
+		}
+
+		const std::uint64_t TotalNs = Counters[I].TotalNs.load(std::memory_order_relaxed);
+		const std::uint64_t MaxNs = Counters[I].MaxNs.load(std::memory_order_relaxed);
+		memoryBenchPrintCounterLine(
+			"[all]",
+			memoryBenchPointName(static_cast<MemoryBenchPoint>(I)),
+			Calls,
+			TotalNs,
+			MaxNs);
+
+		std::array<std::size_t, tuning::MemoryBenchPrintTopThreadGroups> TopThreadBuckets{};
+		TopThreadBuckets.fill(std::numeric_limits<std::size_t>::max());
+		for (std::size_t Rank = 0; Rank < TopThreadBuckets.size(); ++Rank)
+		{
+			std::size_t BestBucket = std::numeric_limits<std::size_t>::max();
+			std::uint64_t BestCalls = 0;
+			for (std::size_t Bucket = 0; Bucket < tuning::MemoryBenchThreadGroupBucketCount; ++Bucket)
+			{
+				bool AlreadySelected = false;
+				for (std::size_t Prev = 0; Prev < Rank; ++Prev)
+				{
+					if (TopThreadBuckets[Prev] == Bucket)
+					{
+						AlreadySelected = true;
+						break;
+					}
+				}
+
+				if (AlreadySelected)
+				{
+					continue;
+				}
+
+				const std::uint64_t BucketCalls =
+					ThreadCounters[I][Bucket].Calls.load(std::memory_order_relaxed);
+				if (BucketCalls > BestCalls)
+				{
+					BestCalls = BucketCalls;
+					BestBucket = Bucket;
+				}
+			}
+
+			if (BestBucket == std::numeric_limits<std::size_t>::max() || BestCalls == 0)
+			{
+				break;
+			}
+
+			TopThreadBuckets[Rank] = BestBucket;
+			const auto& Counter = ThreadCounters[I][BestBucket];
+			const std::uint64_t GroupCalls = Counter.Calls.load(std::memory_order_relaxed);
+			const std::uint64_t GroupTotalNs = Counter.TotalNs.load(std::memory_order_relaxed);
+			const std::uint64_t GroupMaxNs = Counter.MaxNs.load(std::memory_order_relaxed);
+			const double GroupAvgNs = static_cast<double>(GroupTotalNs) / static_cast<double>(GroupCalls);
+			std::printf(
+				"[MEM-BENCH] [thread-bucket] %-30s bucket=%llu calls=%llu total_ms=%.3f avg_ns=%.1f max_ns=%llu\n",
+				memoryBenchPointName(static_cast<MemoryBenchPoint>(I)),
+				static_cast<unsigned long long>(BestBucket),
+				static_cast<unsigned long long>(GroupCalls),
+				static_cast<double>(GroupTotalNs) / 1000000.0,
+				GroupAvgNs,
+				static_cast<unsigned long long>(GroupMaxNs));
+		}
+
+		for (std::size_t SizeClass = 0; SizeClass < tuning::MemoryBenchSizeClassGroupBucketCount; ++SizeClass)
+		{
+			const auto& Counter = SizeClassCounters[I][SizeClass];
+			const std::uint64_t GroupCalls = Counter.Calls.load(std::memory_order_relaxed);
+			if (GroupCalls == 0)
+			{
+				continue;
+			}
+
+			const std::uint64_t GroupTotalNs = Counter.TotalNs.load(std::memory_order_relaxed);
+			const std::uint64_t GroupMaxNs = Counter.MaxNs.load(std::memory_order_relaxed);
+			const double GroupAvgNs = static_cast<double>(GroupTotalNs) / static_cast<double>(GroupCalls);
+			std::printf(
+				"[MEM-BENCH] [size-class] %-30s class=%llu calls=%llu total_ms=%.3f avg_ns=%.1f max_ns=%llu\n",
+				memoryBenchPointName(static_cast<MemoryBenchPoint>(I)),
+				static_cast<unsigned long long>(SizeClass),
+				static_cast<unsigned long long>(GroupCalls),
+				static_cast<double>(GroupTotalNs) / 1000000.0,
+				GroupAvgNs,
+				static_cast<unsigned long long>(GroupMaxNs));
+		}
+	}
+	std::fflush(stdout);
+}
+
+inline void memoryBenchRecord(
+	const MemoryBenchPoint Point,
+	const std::uint64_t ElapsedNs,
+	const std::uint16_t SizeClass = InvalidSizeClass) noexcept
+{
+	auto& Counters = memoryBenchCounters();
+	auto& ThreadCounters = memoryBenchThreadGroupCounters();
+	auto& SizeClassCounters = memoryBenchSizeClassGroupCounters();
+	const std::size_t PointIndex = memoryBenchPointIndex(Point);
+
+	memoryBenchUpdateCounter(Counters[PointIndex], ElapsedNs);
+	memoryBenchUpdateCounter(ThreadCounters[PointIndex][memoryBenchThreadBucketForCurrentThread()], ElapsedNs);
+	if (SizeClass < tuning::MemoryBenchSizeClassGroupBucketCount)
+	{
+		memoryBenchUpdateCounter(SizeClassCounters[PointIndex][SizeClass], ElapsedNs);
+	}
+
+	const std::uint64_t Sample = memoryBenchSampleCounter().fetch_add(1, std::memory_order_relaxed) + 1;
+	if (Sample % tuning::MemoryBenchPrintEverySamples == 0)
+	{
+		memoryBenchPrintSummary();
+	}
+}
+
+class MemoryBenchScope
+{
+public:
+	explicit MemoryBenchScope(
+		const MemoryBenchPoint Point,
+		const std::uint16_t SizeClass = InvalidSizeClass) noexcept
+		: Point(Point)
+		, SizeClass(SizeClass)
+		, StartNs(timestampNs())
+	{
+	}
+
+	~MemoryBenchScope() noexcept
+	{
+		memoryBenchRecord(Point, timestampNs() - StartNs, SizeClass);
+	}
+
+private:
+	MemoryBenchPoint Point;
+	std::uint16_t SizeClass = InvalidSizeClass;
+	std::uint64_t StartNs = 0;
+};
+#else
+class MemoryBenchScope
+{
+public:
+	constexpr explicit MemoryBenchScope(
+		const MemoryBenchPoint,
+		const std::uint16_t = InvalidSizeClass) noexcept
+	{
+	}
+};
+
+inline void memoryBenchPrintSummary() noexcept
+{
+}
+#endif
+
+#if CORE_MEM_CFG_ENABLE_INTERNAL_BENCH_TIMING
+#define CORE_MEM_BENCH_SCOPE(PointValue) ::core::mem::MemoryBenchScope CoreMemBenchScope_##__LINE__(PointValue)
+#define CORE_MEM_BENCH_SCOPE_SC(PointValue, SizeClassValue) \
+	::core::mem::MemoryBenchScope CoreMemBenchScope_##__LINE__(PointValue, static_cast<std::uint16_t>(SizeClassValue))
+#else
+#define CORE_MEM_BENCH_SCOPE(PointValue) ((void)0)
+#define CORE_MEM_BENCH_SCOPE_SC(PointValue, SizeClassValue) ((void)0)
+#endif
 
 inline void spinPause() noexcept
 {

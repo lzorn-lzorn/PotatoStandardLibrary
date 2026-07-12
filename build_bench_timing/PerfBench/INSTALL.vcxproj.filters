@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="E:\Code\PotatoStandardLibrary\build_bench_timing\CMakeFiles\b64b95db67ab15f2997a708c9802f58f\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{7F563CE1-B071-33A0-9254-9AA9DFB22E8B}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

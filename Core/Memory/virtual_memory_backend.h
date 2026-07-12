@@ -475,6 +475,8 @@ public:
      */
     [[nodiscard]] PageSpan acquireSpan(const std::size_t PageCount)
     {
+        CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::PageAllocatorAcquireSpan);
+
         if (PageCount == 0)
         {
             return {};
@@ -595,6 +597,8 @@ public:
      */
     void releaseSpan(const PageSpan& Span)
     {
+        CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::PageAllocatorReleaseSpan);
+
         if (!Span.isValid())
         {
             return;

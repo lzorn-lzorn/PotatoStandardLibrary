@@ -29,7 +29,7 @@ set_property(
 option(
 	POTATO_MEMORY_CAPTURE_STACK
 	"Enable compile-time stack capture in allocator metadata path."
-	OFF
+	ON
 )
 
 option(
@@ -41,5 +41,11 @@ option(
 option(
 	POTATO_MEMORY_LAZY_COMMIT
 	"Enable lazy decommit on PageAllocator span release at compile time."
+	ON
+)
+
+option(
+	POTATO_MEMORY_INTERNAL_BENCH_TIMING
+	"Compile internal allocator timing benchmarks and periodic timing prints."
 	ON
 )

@@ -67,6 +67,8 @@ public:
 		const std::uint16_t SizeClassIndex,
 		const std::size_t BlockSize)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::ThreadCacheAllocate, SizeClassIndex);
+
 		if (SizeClassIndex >= NumSizeClasses) [[unlikely]]
 		{
 			return {};
@@ -93,9 +95,9 @@ public:
 		constexpr std::uint32_t MaxBatch = 128;
 		void* Batch[MaxBatch]{};
 		Span* FetchedSpanHint = nullptr;
-		const std::uint32_t target = std::min<std::uint32_t>(RefillBatch, MaxBatch);
-		const std::uint32_t fetched = CentralPool->fetchBatch(SizeClassIndex, Batch, target, &FetchedSpanHint);
-		if (fetched == 0)
+		const std::uint32_t Target = std::min<std::uint32_t>(RefillBatch, MaxBatch);
+		const std::uint32_t Fetched = CentralPool->fetchBatch(SizeClassIndex, Batch, Target, &FetchedSpanHint);
+		if (Fetched == 0)
 		{
 			return {};
 		}
@@ -105,7 +107,7 @@ public:
 			FreeList.SpanHint = FetchedSpanHint;
 		}
 
-		for (std::uint32_t I = 1; I < fetched; ++I)
+		for (std::uint32_t I = 1; I < Fetched; ++I)
 		{
 			pushBlock(FreeList.Head, Batch[I]);
 			++FreeList.Count;
@@ -123,6 +125,8 @@ public:
 		const std::size_t BlockSize,
 		void* Ptr)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::ThreadCacheDeallocate, SizeClassIndex);
+
 		if (SizeClassIndex >= NumSizeClasses || !Ptr)
 		{
 			return;
@@ -253,6 +257,8 @@ private:
 		const std::uint16_t SizeClassIndex,
 		const std::size_t BlockSize)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::ThreadCacheRefillDeferred, SizeClassIndex);
+
 		if (SizeClassIndex >= NumSizeClasses)
 		{
 			return;
@@ -289,6 +295,8 @@ private:
 		const std::size_t BlockSize,
 		const std::uint16_t RequestedCount)
 	{
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::ThreadCacheSpillDeferred, SizeClassIndex);
+
 		if (SizeClassIndex >= NumSizeClasses || RequestedCount == 0)
 		{
 			return;
@@ -360,6 +368,8 @@ private:
 
 	void drainDeferredToCentral(const bool ForceAll)
 	{
+		CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::ThreadCacheDrainDeferred);
+
 		if (!ForceAll && DeferredBytes <= DeferredBudgetBytes)
 		{
 			return;
@@ -456,6 +466,8 @@ private:
 
 	void trimToBudget(const bool ForceAll)
 	{
+		CORE_MEM_BENCH_SCOPE(MemoryBenchPoint::ThreadCacheTrimToBudget);
+
 		if (!ForceAll && getTotalRetainedBytes() <= MaxBytes)
 		{
 			return;

@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="E:\Code\PotatoStandardLibrary\PerfBench\MemoryAllocatorBenchmark.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="E:\Code\PotatoStandardLibrary\PerfBench\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{EE5B8F67-03C4-3B97-983E-8DE7FCB371FB}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

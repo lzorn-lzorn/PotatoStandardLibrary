@@ -1,0 +1,10 @@
+^E:\CODE\POTATOSTANDARDLIBRARY\BUILD_BENCH_TIMING\CMAKEFILES\DCF5E7D1476D83494F6B262323ACF623\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SE:/Code/PotatoStandardLibrary -BE:/Code/PotatoStandardLibrary/build_bench_timing --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file E:/Code/PotatoStandardLibrary/build_bench_timing/PotatoStandardLibrary.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
