@@ -100,5 +100,4 @@ private:
 	Span* SpanHint { nullptr };   // 缓存最近使用的 Span 对象
 };
 
-
 }
