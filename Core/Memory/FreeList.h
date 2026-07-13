@@ -22,47 +22,75 @@ public:
 
 	void* pop() noexcept
 	{
-		return nullptr;
+		if (!Head) [[unlikely]]
+		{
+			return nullptr;
+		}
+		void* Block = Head;
+		Head = *reinterpret_cast<void**>(Block);
+		--Count;
+		return Block;
 	}
 
 	void pushBatch(void* BatchHead, void* BatchTail, std::uint16_t BatchCount) noexcept
 	{
-
+		*reinterpret_cast<void**>(BatchTail) = Head;
+		Head = BatchHead;
+		Count += BatchCount;
 	}
 
 	void* popBatch(std::uint16_t MaxCount, void*& Tail) noexcept
 	{
-
+		if (!Head) [[unlikely]]
+		{
+			Tail = nullptr;
+			return nullptr;
+		}
+		void* BatchHead = Head;
+		void* Current = BatchHead;
+		std::uint16_t Popped = 0;
+		while (Current && Popped < MaxCount)
+		{
+			Tail = Current;
+			Current = *reinterpret_cast<void**>(Current);
+			++Popped;
+		}
+		*reinterpret_cast<void**>(Tail) = nullptr;
+		Head = Current;
+		Count -= Popped;
+		return BatchHead;
 	}
 
 	bool isEmpty() const noexcept
 	{
-		return true;
+		return Head == nullptr;
 	}
 
 	std::uint16_t getCount() const noexcept
 	{
-		return 0;
+		return Count;
 	}
 
 	std::uint16_t getMaxCount() const noexcept
 	{
-		return 0;
+		return MaxCount;
 	}
 
 	Span* getSpanHint() const noexcept
 	{
-		return nullptr;
+		return SpanHint;
 	}
 
 	void setSpanHint(Span* SpanHint) noexcept
 	{
-
+		this->SpanHint = SpanHint;
 	}
 
 	void clear() noexcept 
 	{
-
+		Head = nullptr;
+		SpanHint = nullptr;
+		Count = 0;
 	}
 
 private:
