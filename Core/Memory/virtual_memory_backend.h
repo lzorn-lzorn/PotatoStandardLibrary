@@ -729,18 +729,18 @@ private:
 
     [[nodiscard]] bool tryPopCachedSpanLocked(Shard& ShardState, const std::size_t PageCount, PageSpan& OutSpan)
     {
-        std::vector<PageSpan>& bucket = ShardState.FreeSpanCache[getCacheBucket(PageCount)];
-        for (std::size_t i = bucket.size(); i > 0; --i)
+        std::vector<PageSpan>& Bucket = ShardState.FreeSpanCache[getCacheBucket(PageCount)];
+        for (std::size_t i = Bucket.size(); i > 0; --i)
         {
-            PageSpan& candidate = bucket[i - 1];
-            if (candidate.PageCount != PageCount)
+            PageSpan& Candidate = Bucket[i - 1];
+            if (Candidate.PageCount != PageCount)
             {
                 continue;
             }
 
-            OutSpan = candidate;
-            bucket[i - 1] = bucket.back();
-            bucket.pop_back();
+            OutSpan = Candidate;
+            Bucket[i - 1] = Bucket.back();
+            Bucket.pop_back();
             return true;
         }
 
@@ -793,9 +793,9 @@ private:
             }
             shard.Regions.clear();
             shard.RegionIndex.clear();
-            for (std::vector<PageSpan>& bucket : shard.FreeSpanCache)
+            for (std::vector<PageSpan>& Bucket : shard.FreeSpanCache)
             {
-                bucket.clear();
+                Bucket.clear();
             }
             shard.OversizedFreeSpanCache.clear();
         }
