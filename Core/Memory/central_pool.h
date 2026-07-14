@@ -15,6 +15,7 @@
 #include "../Containers/radix_tree.h"
 
 #include "memory_common.h"
+#include "Span.h"
 #include "virtual_memory_backend.h"
 
 namespace core::mem
@@ -100,27 +101,6 @@ struct SizeClass
 	std::uint16_t PagesPerSpan = 0;
 };
 
-struct Span
-{
-	Span* Next = nullptr;
-	Span* Prev = nullptr;
-	Span* PoolNext = nullptr;
-
-	std::uint32_t BlockSize = 0;
-	std::uint16_t TotalBlocks = 0;
-	std::uint16_t FreeBlocks = 0;
-	std::uint16_t SizeClassIndex = InvalidSizeClass;
-	std::uint16_t BucketShardIndex = 0;
-
-	void* FreeList = nullptr;
-	std::byte* SpanBase = nullptr;
-	PageSpan BackingSpan{};
-
-	bool IsInPartialList = false;
-	bool IsInEmptyList = false;
-	bool IsReleased = false;
-};
-
 class CentralPool
 {
 public:
@@ -201,34 +181,39 @@ public:
 			}
 		}
 
-		if (SpanObj->IsInEmptyList)
+		if (SpanObj->isInEmptyList())
 		{
 			removeSpan(Shard.EmptySpans, SpanObj);
-			SpanObj->IsInEmptyList = false;
+			SpanObj->setEmpty(false);
 			if (Shard.EmptySpanCount > 0)
 			{
 				--Shard.EmptySpanCount;
 			}
 		}
 
-		if (!SpanObj->IsInPartialList)
+		if (!SpanObj->isInPartialList())
 		{
 			insertSpan(Shard.PartialSpans, SpanObj);
-			SpanObj->IsInPartialList = true;
+			SpanObj->setPartial(true);
 		}
 
 		std::uint32_t Allocated = 0;
-		while (Allocated < MaxBlocks && SpanObj->FreeList)
+		while (Allocated < MaxBlocks)
 		{
-			OutBlocks[Allocated] = popBlock(SpanObj->FreeList);
+			void* Block = SpanObj->popBlock();
+			if (!Block)
+			{
+				break;
+			}
+
+			OutBlocks[Allocated] = Block;
 			++Allocated;
-			--SpanObj->FreeBlocks;
 		}
 
-		if (SpanObj->FreeBlocks == 0 && SpanObj->IsInPartialList)
+		if (SpanObj->isFull() && SpanObj->isInPartialList())
 		{
 			removeSpan(Shard.PartialSpans, SpanObj);
-			SpanObj->IsInPartialList = false;
+			SpanObj->setPartial(false);
 		}
 
 		if (OutSpanHint)
@@ -296,7 +281,7 @@ public:
 				return;
 			}
 
-			SizeClassBucketShard& Shard = Bucket.Shards[normalizeShardIndex(SpanObj->BucketShardIndex)];
+			SizeClassBucketShard& Shard = Bucket.Shards[normalizeShardIndex(SpanObj->getBucketShardIndex())];
 			std::lock_guard<SpinLock> Lock(Shard.Lock);
 			applyReturnedBatchLocked(Shard, *SpanObj, Block, Block, 1);
 			trimEmptySpansLocked(Shard);
@@ -309,7 +294,7 @@ public:
 			void* Next = *reinterpret_cast<void**>(Current);
 			Span* SpanObj = findSpanHinted(Current, SpanHint, SizeClassIndex);
 
-			if (!SpanObj || SpanObj->IsReleased)
+			if (!SpanObj || SpanObj->isReleased())
 			{
 				Current = Next;
 				continue;
@@ -322,7 +307,7 @@ public:
 				{
 					Batch = &Batches[BatchCount++];
 					Batch->SpanObj = SpanObj;
-					Batch->ShardIndex = SpanObj->BucketShardIndex;
+					Batch->ShardIndex = SpanObj->getBucketShardIndex();
 				}
 				else
 				{
@@ -397,7 +382,7 @@ public:
 		}
 
 		const std::size_t CurrentShard = getThreadShardIndex();
-		const std::size_t OwnerShard = normalizeShardIndex(SpanObj->BucketShardIndex);
+		const std::size_t OwnerShard = normalizeShardIndex(SpanObj->getBucketShardIndex());
 		return CurrentShard == OwnerShard;
 	}
 
@@ -550,30 +535,22 @@ private:
 			return nullptr;
 		}
 
-		SpanRawPtr->BlockSize = Info.BlockSize;
-		SpanRawPtr->TotalBlocks = Info.BlocksPerSpan;
-		SpanRawPtr->FreeBlocks = Info.BlocksPerSpan;
-		SpanRawPtr->SizeClassIndex = ClassIndex;
-		SpanRawPtr->BucketShardIndex = ShardIndex;
-		SpanRawPtr->SpanBase = PageSpan.Base;
-		SpanRawPtr->BackingSpan = PageSpan;
-		SpanRawPtr->IsReleased = false;
-
-		std::byte* Block = SpanRawPtr->SpanBase;
-		for (std::uint16_t i = 0; i < SpanRawPtr->TotalBlocks; ++i)
-		{
-			pushBlock(SpanRawPtr->FreeList, Block);
-			Block += SpanRawPtr->BlockSize;
-		}
+		SpanRawPtr->setup(
+			Info.BlockSize,
+			Info.BlocksPerSpan,
+			ClassIndex,
+			ShardIndex,
+			PageSpan.Base,
+			PageSpan);
 
 		if (!registerSpanPages(*SpanRawPtr))
 		{
-			PageAllocator->releaseSpan(SpanRawPtr->BackingSpan);
+			PageAllocator->releaseSpan(SpanRawPtr->getBackingSpan());
 			releaseSpanObject(SpanRawPtr);
 			return nullptr;
 		}
 		insertSpan(Shard.EmptySpans, SpanRawPtr);
-		SpanRawPtr->IsInEmptyList = true;
+		SpanRawPtr->setEmpty(true);
 		++Shard.EmptySpanCount;
 
 		return SpanRawPtr;
@@ -581,21 +558,21 @@ private:
 
 	void releaseEmptySpan(SizeClassBucketShard& Shard, Span* InSpan)
 	{
-		if (!InSpan || InSpan->IsReleased)
+		if (!InSpan || InSpan->isReleased())
 		{
 			return;
 		}
 
-		if (InSpan->IsInPartialList)
+		if (InSpan->isInPartialList())
 		{
 			removeSpan(Shard.PartialSpans, InSpan);
-			InSpan->IsInPartialList = false;
+			InSpan->setPartial(false);
 		}
 
-		if (InSpan->IsInEmptyList)
+		if (InSpan->isInEmptyList())
 		{
 			removeSpan(Shard.EmptySpans, InSpan);
-			InSpan->IsInEmptyList = false;
+			InSpan->setEmpty(false);
 			if (Shard.EmptySpanCount > 0)
 			{
 				--Shard.EmptySpanCount;
@@ -603,9 +580,9 @@ private:
 		}
 
 		unregisterSpanPages(*InSpan);
-		PageAllocator->releaseSpan(InSpan->BackingSpan);
+		PageAllocator->releaseSpan(InSpan->getBackingSpan());
 
-		InSpan->IsReleased = true;
+		InSpan->setReleased(true);
 		releaseSpanObject(InSpan);
 	}
 
@@ -649,7 +626,7 @@ private:
 			if (Span* ClassSpan = tryPopHead(SpanClassFreeLists[ClassIndex]))
 			{
 				SpanPoolFreeCount.fetch_sub(1, std::memory_order_relaxed);
-				*ClassSpan = {};
+				ClassSpan->reset();
 				return ClassSpan;
 			}
 		}
@@ -657,7 +634,7 @@ private:
 		if (Span* GenericSpan = tryPopHead(SpanFreeList))
 		{
 			SpanPoolFreeCount.fetch_sub(1, std::memory_order_relaxed);
-			*GenericSpan = {};
+			GenericSpan->reset();
 			return GenericSpan;
 		}
 
@@ -678,7 +655,7 @@ private:
 			if (Span* ClassSpan = tryPopHead(SpanClassFreeLists[ClassIndex]))
 			{
 				SpanPoolFreeCount.fetch_sub(1, std::memory_order_relaxed);
-				*ClassSpan = {};
+				ClassSpan->reset();
 				return ClassSpan;
 			}
 		}
@@ -686,7 +663,7 @@ private:
 		if (Span* GenericSpan = tryPopHead(SpanFreeList))
 		{
 			SpanPoolFreeCount.fetch_sub(1, std::memory_order_relaxed);
-			*GenericSpan = {};
+			GenericSpan->reset();
 			return GenericSpan;
 		}
 
@@ -699,8 +676,8 @@ private:
 		{
 			return;
 		}
-		const std::uint16_t ClassIndex = InSpan->SizeClassIndex;
-		*InSpan = {};
+		const std::uint16_t ClassIndex = InSpan->getSizeClassIndex();
+		InSpan->reset();
 
 		auto pushHead = [](std::atomic<Span*>& Head, Span* Node) {
 			Span* OldHead = Head.load(std::memory_order_acquire);
@@ -739,7 +716,7 @@ private:
 		Span* LocalTail = nullptr;
 		for (std::size_t i = 0; i < SpanPoolChunkSize; ++i)
 		{
-			chunkBase[i] = {};
+			chunkBase[i].reset();
 			chunkBase[i].PoolNext = LocalHead;
 			LocalHead = &chunkBase[i];
 			if (!LocalTail)
@@ -769,17 +746,17 @@ private:
 
 	[[nodiscard]] bool registerSpanPages(Span& InSpan)
 	{
-		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::CentralSpanRegisterPages, InSpan.SizeClassIndex);
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::CentralSpanRegisterPages, InSpan.getSizeClassIndex());
 
-		if (!InSpan.BackingSpan.isValid())
+		if (!InSpan.getBackingSpan().isValid())
 		{
 			return false;
 		}
 
-		const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(InSpan.SpanBase);
+		const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(InSpan.getSpanBase());
 		std::vector<std::uint64_t> insertedPageBases;
-		insertedPageBases.reserve(InSpan.BackingSpan.PageCount);
-		for (std::size_t i = 0; i < InSpan.BackingSpan.PageCount; ++i)
+		insertedPageBases.reserve(InSpan.getBackingSpan().PageCount);
+		for (std::size_t i = 0; i < InSpan.getBackingSpan().PageCount; ++i)
 		{
 			const std::uint64_t pageBase = static_cast<std::uint64_t>(base + i * PageSize);
 			bool Inserted = false;
@@ -808,15 +785,15 @@ private:
 
 	void unregisterSpanPages(const Span& InSpan)
 	{
-		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::CentralSpanUnregisterPages, InSpan.SizeClassIndex);
+		CORE_MEM_BENCH_SCOPE_SC(MemoryBenchPoint::CentralSpanUnregisterPages, InSpan.getSizeClassIndex());
 
-		if (!InSpan.BackingSpan.isValid())
+		if (!InSpan.getBackingSpan().isValid())
 		{
 			return;
 		}
 
-		const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(InSpan.SpanBase);
-		for (std::size_t i = 0; i < InSpan.BackingSpan.PageCount; ++i)
+		const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(InSpan.getSpanBase());
+		for (std::size_t i = 0; i < InSpan.getBackingSpan().PageCount; ++i)
 		{
 			const std::uint64_t pageBase = static_cast<std::uint64_t>(base + i * PageSize);
 			PageMapShard& Shard = getPageMapShard(pageBase);
@@ -836,15 +813,15 @@ private:
 
 	[[nodiscard]] static bool isBlockInSpan(const Span& InSpan, const void* Ptr) noexcept
 	{
-		if (!InSpan.SpanBase || InSpan.BlockSize == 0 || InSpan.TotalBlocks == 0)
+		if (!InSpan.getSpanBase() || InSpan.getBlockSize() == 0 || InSpan.getTotalBlocks() == 0)
 		{
 			return false;
 		}
 
 		const std::uintptr_t Address = reinterpret_cast<std::uintptr_t>(Ptr);
-		const std::uintptr_t Begin = reinterpret_cast<std::uintptr_t>(InSpan.SpanBase);
+		const std::uintptr_t Begin = reinterpret_cast<std::uintptr_t>(InSpan.getSpanBase());
 		const std::uintptr_t End = Begin +
-			static_cast<std::uintptr_t>(InSpan.BlockSize) * static_cast<std::uintptr_t>(InSpan.TotalBlocks);
+			static_cast<std::uintptr_t>(InSpan.getBlockSize()) * static_cast<std::uintptr_t>(InSpan.getTotalBlocks());
 		return Address >= Begin && Address < End;
 	}
 
@@ -854,8 +831,8 @@ private:
 		const std::uint16_t ExpectedSizeClass) const
 	{
 		if (Hint &&
-			!Hint->IsReleased &&
-			Hint->SizeClassIndex == ExpectedSizeClass &&
+			!Hint->isReleased() &&
+			Hint->getSizeClassIndex() == ExpectedSizeClass &&
 			isBlockInSpan(*Hint, Ptr))
 		{
 			return Hint;
@@ -867,7 +844,7 @@ private:
 			return nullptr;
 		}
 
-		if (SpanObj->IsReleased || SpanObj->SizeClassIndex != ExpectedSizeClass)
+		if (SpanObj->isReleased() || SpanObj->getSizeClassIndex() != ExpectedSizeClass)
 		{
 			return nullptr;
 		}
@@ -882,38 +859,32 @@ private:
 		void* BatchTail,
 		const std::uint32_t BatchCount)
 	{
-		if (BatchCount == 0 || !BatchHead || !BatchTail || InSpan.IsReleased)
+		if (BatchCount == 0 || !BatchHead || !BatchTail || InSpan.isReleased())
 		{
 			return;
 		}
 
-		const bool WasFull = InSpan.FreeBlocks == 0;
-		*reinterpret_cast<void**>(BatchTail) = InSpan.FreeList;
-		InSpan.FreeList = BatchHead;
-
-		const std::uint32_t nextFreeBlocks = std::min<std::uint32_t>(
-			static_cast<std::uint32_t>(InSpan.TotalBlocks),
-			static_cast<std::uint32_t>(InSpan.FreeBlocks) + BatchCount);
-		InSpan.FreeBlocks = static_cast<std::uint16_t>(nextFreeBlocks);
+		const bool WasFull = InSpan.isFull();
+		InSpan.pushBatch(BatchHead, BatchTail, BatchCount);
 
 		if (WasFull)
 		{
 			insertSpan(Shard.PartialSpans, &InSpan);
-			InSpan.IsInPartialList = true;
+			InSpan.setPartial(true);
 		}
 
-		if (InSpan.FreeBlocks == InSpan.TotalBlocks)
+		if (InSpan.isEmpty())
 		{
-			if (InSpan.IsInPartialList)
+			if (InSpan.isInPartialList())
 			{
 				removeSpan(Shard.PartialSpans, &InSpan);
-				InSpan.IsInPartialList = false;
+				InSpan.setPartial(false);
 			}
 
-			if (!InSpan.IsInEmptyList)
+			if (!InSpan.isInEmptyList())
 			{
 				insertSpan(Shard.EmptySpans, &InSpan);
-				InSpan.IsInEmptyList = true;
+				InSpan.setEmpty(true);
 				++Shard.EmptySpanCount;
 			}
 		}

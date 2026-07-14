@@ -8,18 +8,10 @@
 #include <cstdint>
 
 #include "central_pool.h"
-// #include "FreeList.h"
+#include "FreeList.h"
 
 namespace core::mem
 {
-
-struct FreeList
-{
-	void* Head = nullptr;
-	std::uint16_t Count = 0;
-	std::uint16_t MaxCount = 0;
-	Span* SpanHint = nullptr;
-};
 
 struct DeferredFreeList
 {
@@ -57,7 +49,7 @@ public:
 				tuning::ThreadCacheMinObjectsPerClass,
 				BytesPerClass / BlockSize);
 			const std::size_t Capped = std::min<std::size_t>(CountFromBytes, Config.ThreadCacheMaxPerClass);
-			FreeLists[I].MaxCount = static_cast<std::uint16_t>(Capped);
+			FreeLists[I].setMaxCount(static_cast<std::uint16_t>(Capped));
 		}
 	}
 
@@ -75,16 +67,15 @@ public:
 			return {};
 		}
 
-		FreeList& FreeList = FreeLists[SizeClassIndex];
-		if (!FreeList.Head)
+		FreeList& List = FreeLists[SizeClassIndex];
+		if (List.isEmpty())
 		{
 			refillFromDeferred(SizeClassIndex, BlockSize);
 		}
 
-		if (FreeList.Head) [[likely]]
+		if (!List.isEmpty()) [[likely]]
 		{
-			void* Block = popBlock(FreeList.Head);
-			--FreeList.Count;
+			void* Block = List.pop();
 			CurrentBytes -= BlockSize;
 
 			ThreadCacheAllocation Result;
@@ -105,13 +96,12 @@ public:
 
 		if (FetchedSpanHint)
 		{
-			FreeList.SpanHint = FetchedSpanHint;
+			List.setSpanHint(FetchedSpanHint);
 		}
 
 		for (std::uint32_t I = 1; I < Fetched; ++I)
 		{
-			pushBlock(FreeList.Head, Batch[I]);
-			++FreeList.Count;
+			List.push(Batch[I]);
 			CurrentBytes += BlockSize;
 		}
 
@@ -133,7 +123,7 @@ public:
 			return;
 		}
 
-		FreeList& FreeList = FreeLists[SizeClassIndex];
+		FreeList& List = FreeLists[SizeClassIndex];
 		const bool RouteDeferred = shouldRouteToDeferred(SizeClassIndex, Ptr);
 		if (RouteDeferred)
 		{
@@ -144,20 +134,19 @@ public:
 		}
 		else
 		{
-			pushBlock(FreeList.Head, Ptr);
-			++FreeList.Count;
+			List.push(Ptr);
 			CurrentBytes += BlockSize;
 		}
 
-		if (FreeList.Count > FreeList.MaxCount || CurrentBytes > MaxBytes)
+		if (List.getCount() > List.getMaxCount() || CurrentBytes > MaxBytes)
 		{
-			const std::uint16_t SpillCount = FreeList.MaxCount > 0
+			const std::uint16_t SpillCount = List.getMaxCount() > 0
 				? static_cast<std::uint16_t>(
 					std::max<std::uint32_t>(
 						tuning::ThreadCacheSpillMinCount,
 						std::min<std::uint32_t>(
 							RefillBatch,
-							static_cast<std::uint32_t>(FreeList.MaxCount / 4 + 1))))
+							static_cast<std::uint32_t>(List.getMaxCount() / 4 + 1))))
 				: 1;
 			spillToDeferred(SizeClassIndex, BlockSize, SpillCount);
 		}
@@ -189,7 +178,11 @@ public:
 		for (std::size_t I = 0; I < NumSizeClasses; ++I)
 		{
 			const std::size_t BlockSize = classIndexToSize(static_cast<std::uint16_t>(I));
-			drainToCentral(static_cast<std::uint16_t>(I), BlockSize, FreeLists[I].Count, FreeLists[I].SpanHint);
+			drainToCentral(
+				static_cast<std::uint16_t>(I),
+				BlockSize,
+				FreeLists[I].getCount(),
+				FreeLists[I].getSpanHint());
 		}
 	}
 
@@ -214,15 +207,16 @@ private:
 		const void* Ptr,
 		const std::uint16_t SizeClassIndex) noexcept
 	{
-		if (!Hint || Hint->IsReleased || Hint->SizeClassIndex != SizeClassIndex)
+		if (!Hint || Hint->isReleased() || Hint->getSizeClassIndex() != SizeClassIndex)
 		{
 			return false;
 		}
 
 		const std::uintptr_t Address = reinterpret_cast<std::uintptr_t>(Ptr);
-		const std::uintptr_t Begin = reinterpret_cast<std::uintptr_t>(Hint->SpanBase);
+		const std::uintptr_t Begin = reinterpret_cast<std::uintptr_t>(Hint->getSpanBase());
 		const std::uintptr_t End = Begin +
-			static_cast<std::uintptr_t>(Hint->BlockSize) * static_cast<std::uintptr_t>(Hint->TotalBlocks);
+			static_cast<std::uintptr_t>(Hint->getBlockSize()) *
+			static_cast<std::uintptr_t>(Hint->getTotalBlocks());
 		return Address >= Begin && Address < End;
 	}
 
@@ -233,8 +227,8 @@ private:
 			return false;
 		}
 
-		FreeList& FreeList = FreeLists[SizeClassIndex];
-		if (isBlockInSpanHint(FreeList.SpanHint, Ptr, SizeClassIndex))
+		FreeList& List = FreeLists[SizeClassIndex];
+		if (isBlockInSpanHint(List.getSpanHint(), Ptr, SizeClassIndex))
 		{
 			return false;
 		}
@@ -243,11 +237,11 @@ private:
 		const bool IsCurrentShard = CentralPool->isCurrentThreadShardForPointer(
 			Ptr,
 			SizeClassIndex,
-			FreeList.SpanHint,
+			List.getSpanHint(),
 			&ResolvedHint);
 		if (ResolvedHint)
 		{
-			FreeList.SpanHint = ResolvedHint;
+			List.setSpanHint(ResolvedHint);
 			DeferredLists[SizeClassIndex].SpanHint = ResolvedHint;
 		}
 
@@ -271,7 +265,7 @@ private:
 			return;
 		}
 
-		FreeList& FreeList = FreeLists[SizeClassIndex];
+		FreeList& List = FreeLists[SizeClassIndex];
 		const std::uint16_t Target = std::max<std::uint16_t>(1, RefillBatch);
 		std::uint16_t Moved = 0;
 		while (Moved < Target && Deferred.Head)
@@ -279,8 +273,7 @@ private:
 			void* Block = popBlock(Deferred.Head);
 			--Deferred.Count;
 			DeferredBytes -= BlockSize;
-			pushBlock(FreeList.Head, Block);
-			++FreeList.Count;
+			List.push(Block);
 			CurrentBytes += BlockSize;
 			++Moved;
 		}
@@ -303,13 +296,12 @@ private:
 			return;
 		}
 
-		FreeList& FreeList = FreeLists[SizeClassIndex];
+		FreeList& List = FreeLists[SizeClassIndex];
 		DeferredFreeList& Deferred = DeferredLists[SizeClassIndex];
 		std::uint16_t Spilled = 0;
-		while (Spilled < RequestedCount && FreeList.Head)
+		while (Spilled < RequestedCount && !List.isEmpty())
 		{
-			void* Block = popBlock(FreeList.Head);
-			--FreeList.Count;
+			void* Block = List.pop();
 			CurrentBytes -= BlockSize;
 			pushBlock(Deferred.Head, Block);
 			++Deferred.Count;
@@ -319,12 +311,12 @@ private:
 
 		if (Deferred.SpanHint == nullptr)
 		{
-			Deferred.SpanHint = FreeList.SpanHint;
+			Deferred.SpanHint = List.getSpanHint();
 		}
 
-		if (!FreeList.Head)
+		if (List.isEmpty())
 		{
-			FreeList.SpanHint = nullptr;
+			List.setSpanHint(nullptr);
 		}
 	}
 
@@ -440,16 +432,15 @@ private:
 			return;
 		}
 
-		FreeList& FreeList = FreeLists[SizeClassIndex];
+		FreeList& List = FreeLists[SizeClassIndex];
 		void* Chain = nullptr;
 		std::uint32_t Drained = 0;
 
-		while (Drained < RequestedCount && FreeList.Head)
+		while (Drained < RequestedCount && !List.isEmpty())
 		{
-			void* Block = popBlock(FreeList.Head);
+			void* Block = List.pop();
 			*reinterpret_cast<void**>(Block) = Chain;
 			Chain = Block;
-			--FreeList.Count;
 			CurrentBytes -= BlockSize;
 			++Drained;
 		}
@@ -459,9 +450,9 @@ private:
 			CentralPool->returnBatch(SizeClassIndex, Chain, Drained, SpanHint);
 		}
 
-		if (FreeList.Count == 0)
+		if (List.isEmpty())
 		{
-			FreeList.SpanHint = nullptr;
+			List.setSpanHint(nullptr);
 		}
 	}
 
@@ -489,8 +480,8 @@ private:
 		{
 			for (std::size_t I = 0; I < NumSizeClasses; ++I)
 			{
-				FreeList& FreeList = FreeLists[I];
-				if (!FreeList.Head || FreeList.Count == 0)
+				FreeList& List = FreeLists[I];
+				if (List.isEmpty() || List.getCount() == 0)
 				{
 					continue;
 				}
@@ -499,8 +490,8 @@ private:
 				drainToCentral(
 					static_cast<std::uint16_t>(I),
 					BlockSize,
-					FreeList.Count,
-					FreeList.SpanHint);
+					List.getCount(),
+					List.getSpanHint());
 			}
 			return;
 		}
@@ -516,19 +507,19 @@ private:
 			for (std::size_t offset = 0; offset < NumSizeClasses; ++offset)
 			{
 				const std::size_t index = (LastDrainClass + offset) % NumSizeClasses;
-				FreeList& FreeList = FreeLists[index];
-				if (!FreeList.Head || FreeList.Count == 0)
+				FreeList& List = FreeLists[index];
+				if (List.isEmpty() || List.getCount() == 0)
 				{
 					continue;
 				}
 
 				const std::size_t BlockSize = classIndexToSize(static_cast<std::uint16_t>(index));
-				const std::uint16_t Requested = std::min<std::uint16_t>(FreeList.Count, DrainChunk);
+				const std::uint16_t Requested = std::min<std::uint16_t>(List.getCount(), DrainChunk);
 				drainToCentral(
 					static_cast<std::uint16_t>(index),
 					BlockSize,
 					Requested,
-					FreeList.SpanHint);
+					List.getSpanHint());
 				LastDrainClass = (index + 1) % NumSizeClasses;
 				Drained = true;
 				break;

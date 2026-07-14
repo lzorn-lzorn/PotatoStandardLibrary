@@ -1253,23 +1253,23 @@ public:
      * @brief 从十六进制字符串构造（支持 #RGBA, #RRGGBBAA, RRGGBBAA, RGBA）
      * @return 线性颜色（输入为 sRGB）
      */
-    static linear_color4d from_hex(std::string_view hex) 
-	{
+    static linear_color4d from_hex(std::string_view hex)
+    {
         std::string_view trimmed = hex;
         if (trimmed.starts_with('#'))
             trimmed.remove_prefix(1);
-        
+
         uint32_t int_value = 0;
         uint8_t a = 255;
-        
-        if (trimmed.size() == 4) 
-		{
+
+        if (trimmed.size() == 4)
+        {
             // RGBA -> 每个字符重复
-            auto fromHexChar = [](char c) -> uint8_t 
-			{
+            auto fromHexChar = [](char c) -> uint8_t
+            {
                 if (c >= '0' && c <= '9') return c - '0';
                 if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-                if (c >= 'a' && c <= 'F') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
                 return 0;
             };
             uint8_t r = fromHexChar(trimmed[0]);
@@ -1277,37 +1277,39 @@ public:
             uint8_t b = fromHexChar(trimmed[2]);
             a = fromHexChar(trimmed[3]);
             int_value = (r << 20) | (r << 16) | (g << 12) | (g << 8) | (b << 4) | b;
-        } 
-		else if (trimmed.size() == 8) 
-		{
+        }
+        else if (trimmed.size() == 8)
+        {
             auto result = std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), int_value, 16);
-            if (result.ec == std::errc{}) 
-			{
+            if (result.ec == std::errc{})
+            {
                 a = int_value & 0xFF;
                 int_value >>= 8;
-            } 
-			else 
-			{
+            }
+            else
+            {
                 int_value = 0;
             }
-        } 
-		else if (trimmed.size() == 6) 
-		{
+        }
+        else if (trimmed.size() == 6)
+        {
             // 只有 RGB，Alpha 默认 255
             auto result = std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), int_value, 16);
-            if (result.ec != std::errc{}) 
-			{
-				int_value = 0;
-			}
+            if (result.ec != std::errc{})
+            {
+                int_value = 0;
+            }
         }
-		else 
-		{
+        else
+        {
+            int_value = 0;
+            a = 255;
+        }
 
-		}
         uint8_t r = (int_value >> 16) & 0xFF;
         uint8_t g = (int_value >> 8) & 0xFF;
         uint8_t b = int_value & 0xFF;
-        
+
         linear_color3d rgb = linear_color3d::from_byte_srgb(r, g, b);
         return linear_color4d(rgb, a / 255.0f);
     }
@@ -2259,11 +2261,12 @@ inline TMatrix<Ty, Rows, Cols> Random_Matrix(Ty left, Ty right) noexcept
 {
     TMatrix<Ty, Rows, Cols> result{};
     std::uniform_real_distribution<Ty> dist(left, right);
+    static thread_local std::mt19937 rng{std::random_device{}()};
     for (size_t i = 0; i < Rows; ++i)
     {
         for (size_t j = 0; j < Cols; ++j)
         {
-            result.m[i][j] = dist(get_rng());
+            result.m[i][j] = dist(rng);
         }
     }
             
@@ -2286,7 +2289,7 @@ template <typename Ty, size_t Rows, size_t Cols>
 template <typename Ty, size_t Cols, size_t Middle, size_t Rows>
 [[nodiscard]] constexpr inline TMatrix <Ty, Cols, Rows> Multiply_Natively(const TMatrix <Ty, Cols, Middle>& mat1, const TMatrix <Ty, Middle, Rows>& mat2) noexcept
 {
-    TMatrix <Ty, Cols, Rows> result = zero();
+    TMatrix <Ty, Cols, Rows> result = TMatrix<Ty, Cols, Rows>::zero();
     for (size_t i = 0; i < Cols; ++i) 
     {
         for (size_t k = 0; k < Middle; ++k) 
@@ -2298,12 +2301,14 @@ template <typename Ty, size_t Cols, size_t Middle, size_t Rows>
             }
         }
     }
+
+    return result;
 }
 
 template <typename Ty, size_t N>
 [[nodiscard]] constexpr inline TMatrix <Ty, N, N> Multiply_Natively(const TMatrix <Ty, N, N>& mat1, const TMatrix <Ty, N, N>& mat2) noexcept
 {
-	TMatrix <Ty, N, N> result = zero();
+	TMatrix <Ty, N, N> result = TMatrix<Ty, N, N>::zero();
     if constexpr (N == 4)
     {
         result.m[0][0] = mat1.m[0][0] * mat2.m[0][0] + mat1.m[0][1] * mat2.m[1][0] + mat1.m[0][2] * mat2.m[2][0] + mat1.m[0][3] * mat2.m[3][0];
@@ -3114,7 +3119,8 @@ struct rotator
 
     static rotator from_string(const std::string& str) noexcept
     {
-       
+        (void)str;
+        return rotator{};
     }
     static rotator step(rotator current, rotator target, float step_size) noexcept
     {
@@ -3602,7 +3608,7 @@ struct standing_cylinder
 
     bool contains(point3d point) const noexcept
     {
-        is_point_in_cylinder(point, *this);
+        return is_point_in_cylinder(point, *this);
     }
 };
 

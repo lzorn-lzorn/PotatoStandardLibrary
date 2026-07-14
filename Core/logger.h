@@ -20,12 +20,6 @@
 #include "buffer.h"
 #include "common.h"
 
-#ifndef NDEBUG
-#define BufferSize (64 * 1024)
-#else
-#define BufferSize (256 * 1024)
-#endif
-
 namespace core::component
 {
 static inline std::atomic<unsigned long long> message_uid = 1;

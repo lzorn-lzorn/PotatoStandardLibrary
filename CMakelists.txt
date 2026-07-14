@@ -6,28 +6,66 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+	set(POTATO_STANDARD_IS_TOP_LEVEL ON)
+else()
+	set(POTATO_STANDARD_IS_TOP_LEVEL OFF)
+endif()
+
 # 为 MSVC 添加 /utf-8，避免代码页编码警告 C4819
 add_compile_options(
     "$<$<CXX_COMPILER_ID:MSVC>:/utf-8>"
 )
 
-option(POTATO_STANDARD_BUILD_TESTS "Build tests under Test/." ${PROJECT_IS_TOP_LEVEL})
-option(POTATO_STANDARD_BUILD_BENCHMARKS "Build benchmarks under Benchmark/." ${PROJECT_IS_TOP_LEVEL})
+option(POTATO_STANDARD_BUILD_TESTS "Build tests under Test/." ${POTATO_STANDARD_IS_TOP_LEVEL})
+option(POTATO_STANDARD_BUILD_BENCHMARKS "Build benchmarks under PerfBench/." ${POTATO_STANDARD_IS_TOP_LEVEL})
+option(POTATO_STANDARD_USE_BUNDLED_BENCHMARK "Use bundled benchmark/ when benchmarks are enabled." ON)
+option(POTATO_STANDARD_ENABLE_INSTALL "Enable install/export rules for Core." ${POTATO_STANDARD_IS_TOP_LEVEL})
+option(POTATO_STANDARD_ENABLE_WARNINGS "Enable warning options for Core target compilation." ${POTATO_STANDARD_IS_TOP_LEVEL})
+
+# Keep internal allocator timing disabled by default for library consumers.
+option(POTATO_MEMORY_INTERNAL_BENCH_TIMING "Compile internal allocator timing points and periodic benchmark logs." OFF)
 
 add_subdirectory(Core)
 
 if(POTATO_STANDARD_BUILD_BENCHMARKS)
-	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/CMakeLists.txt" AND
-		EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/PerfBench/CMakeLists.txt")
-		set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-		set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
-		set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-		set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+	set(POTATO_STANDARD_HAS_BENCHMARK_MAIN FALSE)
 
-		add_subdirectory(benchmark EXCLUDE_FROM_ALL)
-		add_subdirectory(PerfBench)
+	if(TARGET benchmark::benchmark_main)
+		set(POTATO_STANDARD_HAS_BENCHMARK_MAIN TRUE)
+	endif()
+
+	if(NOT POTATO_STANDARD_HAS_BENCHMARK_MAIN AND POTATO_STANDARD_USE_BUNDLED_BENCHMARK)
+		if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/CMakeLists.txt")
+			set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+			set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+			set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+			set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+			add_subdirectory(benchmark EXCLUDE_FROM_ALL)
+
+			if(TARGET benchmark::benchmark_main)
+				set(POTATO_STANDARD_HAS_BENCHMARK_MAIN TRUE)
+			endif()
+		else()
+			message(WARNING "Bundled benchmark/ is missing. Benchmarks will be skipped unless benchmark::benchmark_main is provided by parent project.")
+		endif()
+	endif()
+
+	if(NOT POTATO_STANDARD_HAS_BENCHMARK_MAIN AND NOT POTATO_STANDARD_USE_BUNDLED_BENCHMARK)
+		find_package(benchmark CONFIG QUIET)
+		if(TARGET benchmark::benchmark_main)
+			set(POTATO_STANDARD_HAS_BENCHMARK_MAIN TRUE)
+		endif()
+	endif()
+
+	if(POTATO_STANDARD_HAS_BENCHMARK_MAIN)
+		if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/PerfBench/CMakeLists.txt")
+			add_subdirectory(PerfBench)
+		else()
+			message(WARNING "PerfBench/CMakeLists.txt is missing. Skip benchmark targets.")
+		endif()
 	else()
-		message(WARNING "Benchmark sources are incomplete. Skip benchmark targets.")
+		message(WARNING "benchmark::benchmark_main is unavailable. Skip benchmark targets.")
 	endif()
 endif()
 

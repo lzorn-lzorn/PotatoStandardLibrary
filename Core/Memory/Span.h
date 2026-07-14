@@ -1,6 +1,7 @@
 
-#pragma once 
+#pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -78,9 +79,17 @@ public:
 	}
 	void pushBlock(void* Block) noexcept
 	{
+		if (!Block) [[unlikely]]
+		{
+			return;
+		}
+
 		*reinterpret_cast<void**>(Block) = FreeList;
 		FreeList = Block;
-		++FreeBlocks;
+		if (FreeBlocks < TotalBlocks)
+		{
+			++FreeBlocks;
+		}
 	}
 	void pushBatch(void* BatchHead, void* BatchTail, std::uint32_t BatchCount) noexcept
 	{
@@ -91,7 +100,10 @@ public:
 
 		*reinterpret_cast<void**>(BatchTail) = FreeList;
 		FreeList = BatchHead;
-		FreeBlocks += static_cast<std::uint16_t>(BatchCount);
+		const std::uint32_t NextFreeBlocks = std::min<std::uint32_t>(
+			static_cast<std::uint32_t>(TotalBlocks),
+			static_cast<std::uint32_t>(FreeBlocks) + BatchCount);
+		FreeBlocks = static_cast<std::uint16_t>(NextFreeBlocks);
 	}
 	void setPartial(bool v) noexcept { IsInPartialList = v; }
 	void setEmpty(bool v) noexcept { IsInEmptyList = v; }
