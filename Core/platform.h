@@ -39,3 +39,19 @@
 #else
 #	define CPU_RELAX std::this_thread::yield()
 #endif
+
+#if defined(_MSC_VER)
+#   define FORCE_INLINE __forceinline
+#   define INTERFACE __declspec(novtable)
+#else
+#   define FORCE_INLINE inline __attribute__((always_inline))
+#   define INTERFACE
+#endif
+
+/**
+ * @example
+ *      struct INTERFACE Foo {
+ *          virtual void f() = 0;
+ *          virtual ~Foo() = default;
+ *      };
+ */

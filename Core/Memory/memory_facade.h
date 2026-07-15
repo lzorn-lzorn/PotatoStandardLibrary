@@ -18,7 +18,7 @@
 
 #include "Observability/memory_statistics.h"
 #include "thread_cache.h"
-#include "../mpmc_queue.h"
+#include "../Containers/mpmc_queue.h"
 
 namespace core::mem
 {

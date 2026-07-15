@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-#include <Core/observed.h>
+#include <Core/Containers/observed.h>
 
 namespace
 {
