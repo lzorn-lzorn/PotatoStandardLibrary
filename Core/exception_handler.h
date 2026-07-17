@@ -36,27 +36,23 @@ namespace custom {
         on_unknown = current_policy::handle_unknown;
 }
 
-#define TRY try
-
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+// 异常启用:
+#   define TRY try
 // 默认捕获：调用全局处理函数
-#ifndef CATCH
 #	define CATCH                                                \
 		catch (...) {                                           \
 			::custom::on_exception(std::current_exception(),    \
 			std::source_location::current());                   \
 		}
-#endif
 
-#ifndef CATCH_WITH
 #	define CATCH_WITH(handler)                                           \
 		catch (...)                                                      \
 		{                                                                \
 			(handler)(std::current_exception(),                          \
 					std::source_location::current());                    \
 		}
-#endif
 
-#ifndef TRY_CATCH
 #	define TRY_CATCH(...)                                                \
 		try {                                                            \
 			__VA_ARGS__                                                  \
@@ -65,21 +61,25 @@ namespace custom {
 		} catch (...) {                                                  \
 			::custom::on_unknown(std::source_location::current());       \
 		}
-#endif
 
-// 使用自定义处理器(handler 必须是可调用对象, 且不能包含逗号)
-#ifndef TRY_CATCH_WITH
 #	define TRY_CATCH_WITH(handler, ...)                                  \
-		try {                                                            \
-			__VA_ARGS__                                                  \
-		} catch (const std::exception& e) {                              \
-			(handler)(e, std::source_location::current());               \
-		} catch (...) {                                                  \
-			auto eptr = std::current_exception();                        \
-			(handler)(eptr, std::source_location::current());            \
-		}
+        try {                                                            \
+            __VA_ARGS__                                                  \
+        } catch (const std::exception& e) {                              \
+            (handler)(e, std::source_location::current());               \
+        } catch (...) {                                                  \
+            auto eptr = std::current_exception();                        \
+            (handler)(eptr, std::source_location::current());            \
+        }
+#   define THROW(expr) throw expr
+#else
+#   define TRY
+#   define CATCH
+#   define CATCH_WITH(handler)
+#   define TRY_CATCH(...)
+#   define TRY_CATCH_WITH(handler, ...)
+#   define THROW(expr) std::abort() // std::terminate() 本事也属于异常处理框架
 #endif
-
 struct scoped_exception_handler {
     using handler_t = std::function<void(const std::exception&, std::source_location)>;
     using unknown_t = std::function<void(std::source_location)>;
@@ -100,11 +100,6 @@ struct scoped_exception_handler {
     }
 };
 
-#define NOEXCEPTION       \
-	#undef TRY_CATCH_WITH \
-	#undef TRY_CATCH      \
-	#undef CATCH_WITH     \
-	#undef CATCH
 }
 
 
