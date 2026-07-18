@@ -357,4 +357,113 @@ public:
 	}
 };
 
+template <typename RetType, typename ... Args>
+class move_only_delegate : public details::DelegateStorage<false, RetType, Args...>
+{
+	using Super = details::DelegateStorage<false, RetType, Args...>;
+public:
+	using Super::Super;
+	using Super::bound;
+	using Super::execute;
+
+	move_only_delegate() noexcept = default;
+	explicit move_only_delegate(const std::move_only_function<RetType(Args...)>& InFunction) noexcept
+	{
+		bind(InFunction);
+	}
+
+	explicit move_only_delegate(std::move_only_function<RetType(Args...)>&& InFunction) noexcept
+	{
+		bind(std::move(InFunction));
+	}
+
+	move_only_delegate(const move_only_delegate&) = delete;
+	move_only_delegate& operator=(const move_only_delegate&) = delete;
+	move_only_delegate(move_only_delegate&&) noexcept = default;
+	move_only_delegate& operator=(move_only_delegate&&) noexcept = default;
+
+	/**
+	 * @brief Binds a static function to the delegate.
+	 * @usage 
+	 *     - delegate<void(int)> d;
+	 */
+	template <auto Callable>
+		requires std::invocable<decltype(Callable) , Args...>
+		&& std::same_as<std::invoke_result_t<decltype(Callable), Args...>, RetType>
+	void bind()
+	{
+		Super::initFromCallable(Callable);
+	}
+
+	/**
+	 * @brief Binds a member raw function to the delegate.
+	 * @usage 
+	 *     
+	 */
+	template <auto Method, typename ClassType>
+		requires std::is_member_function_pointer_v<decltype(Method)>
+	void bind(ClassType* Instance)
+	{
+		Super::initFromCallable(
+			[Instance](Args... args) -> RetType {
+				return (Instance->*Method)(std::forward<Args>(args)...);
+			}
+		);
+	}
+
+	template <auto Method, typename ClassType>
+	void bind(const std::shared_ptr<ClassType>& InstancePtr)
+	{
+		std::weak_ptr<ClassType> WeakInstancePtr = InstancePtr;
+		Super::initFromCallable(
+			[WeakInstancePtr](Args... args) -> RetType {
+				if (auto Shared = WeakInstancePtr.lock())
+				{
+					return (Shared.get()->*Method)(std::forward<Args>(args)...);
+				}
+				else
+				{
+					throw std::bad_function_call();
+				}
+			}
+		);
+	}
+	
+	template <auto Method, typename ClassType>
+	void bind(const std::weak_ptr<ClassType>& InstanceWeakPtr)
+	{
+		Super::initFromCallable(
+			[InstanceWeakPtr](Args... args) -> RetType {
+				return (InstanceWeakPtr->*Method)(std::forward<Args>(args)...);		
+			}
+		);
+	}
+
+	template <typename Callable>
+		requires std::invocable<Callable, Args...>
+			&& std::same_as<std::invoke_result_t<Callable, Args...>, RetType>
+			&& std::copy_constructible<Callable>
+	void bind(Callable&& InCallable)
+	{
+		Super::initFromCallable(std::forward<Callable>(InCallable));
+	}
+
+	void bind(const std::move_only_function<RetType(Args...)>& InFunction)
+	{
+		Super::initFromCallable(InFunction);
+	}
+
+	void bind(std::move_only_function<RetType(Args...)>&& InFunction)
+	{
+		Super::initFromCallable(std::move(InFunction));
+	}
+
+	std::move_only_function<RetType(Args...)> toStdMoveOnlyFunction() &&
+	{
+		delegate<RetType, Args...> Moved = std::move(*this);
+		return [Moved = std::move(Moved)](Args... args) -> RetType {
+			return Moved.execute(std::forward<Args>(args)...);
+		};
+	}
+};
 } // namespace core
