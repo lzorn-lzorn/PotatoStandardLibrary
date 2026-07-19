@@ -4,7 +4,9 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -14,74 +16,65 @@
 
 namespace core
 {
-/**
- * @brief Inline byte budget used by delegate small-object optimization.
- * @breif Inline byte budget used by delegate small-object optimization.
- * @usage
- *   - constexpr std::size_t inline_budget = core::DelegateSmallStorageSize;
- */
-constexpr std::uint32_t DelegateSmallStorageSize = 64;
 
-/**
- * @brief Runtime token identifying a callback registration inside multicast_delegate.
- * @breif Runtime token identifying a callback registration inside multicast_delegate.
- * @usage
- *   - core::DelegateHandle handle;
- *   - if (handle.isValid()) { multicast.remove(handle); }
- */
+constexpr std::uint32_t DelegateSmallStorageSize = 32;
+
 struct DelegateHandle
 {
-	uint64_t Id = 0;
+	std::uint64_t Id = 0;
 
-	/**
-	 * @brief Returns true when this handle references a valid registration.
-	 * @breif Returns true when this handle references a valid registration.
-	 * @usage
-	 *   - if (handle.isValid()) { remove registration by handle; }
-	 */
-	[[nodiscard]] bool isValid() const noexcept
+	[[nodiscard]] constexpr bool isValid() const noexcept
 	{
 		return Id != 0;
 	}
 
-	/**
-	 * @brief Resets this handle to an invalid value.
-	 * @breif Resets this handle to an invalid value.
-	 * @usage
-	 *   - handle.reset();
-	 */
-	void reset() noexcept
+	constexpr void reset() noexcept
 	{
 		Id = 0;
 	}
 
-	/**
-	 * @brief Compares two handles by underlying id.
-	 * @breif Compares two handles by underlying id.
-	 * @usage
-	 *   - if (left == right) { same registration; }
-	 */
-	bool operator==(const DelegateHandle& Other) const noexcept
-	{
-		return Id == Other.Id;
-	}
+	[[nodiscard]] constexpr bool operator==(const DelegateHandle& Other) const noexcept = default;
 };
 
 namespace details
 {
-template <bool IsCopyable, typename RetType, typename... Args>
+template <bool EnableSBO>
+struct InlineStorage
+{
+	static constexpr std::size_t StorageSize = 0;
+};
+
+template <>
+struct InlineStorage<true>
+{
+	static constexpr std::size_t StorageSize = DelegateSmallStorageSize;
+
+	alignas(std::max_align_t) std::byte Buffer[StorageSize]{};
+};
+
+template <bool IsCopyable, bool EnableSBO, typename RetType, typename... Args>
 class DelegateStorage
 {
-public:
+private:
+	using InlineStorageType = InlineStorage<EnableSBO>;
 	using InvokerType = RetType(*)(void*, Args&&...);
-	using DestructorType = void(*)(void*);
-	using MoveConstructorType = void*(*)(void*, void*);
-	using CopyConstructorType = void*(*)(void*, const void*);
+	using DestroyerType = void(*)(void*) noexcept;
+	using MoverType = void*(*)(void*, void*) noexcept;
+	using CopierType = void*(*)(void*, const void*);
 
+	/** The table is static per callable type, so delegates carry one lifecycle metadata pointer. */
+	struct Operations
+	{
+		DestroyerType Destroy = nullptr;
+		MoverType Move = nullptr;
+		CopierType Copy = nullptr;
+	};
+
+public:
 	DelegateStorage() noexcept = default;
 
 	DelegateStorage(const DelegateStorage& Other)
-		requires (IsCopyable)
+		requires IsCopyable
 	{
 		copyFrom(Other);
 	}
@@ -90,7 +83,7 @@ public:
 		requires (!IsCopyable)
 		= delete;
 
-	DelegateStorage(DelegateStorage&& Other)
+	DelegateStorage(DelegateStorage&& Other) noexcept
 	{
 		moveFrom(std::move(Other));
 	}
@@ -101,12 +94,13 @@ public:
 	}
 
 	DelegateStorage& operator=(const DelegateStorage& Other)
-		requires (IsCopyable)
+		requires IsCopyable
 	{
 		if (this != &Other)
 		{
+			DelegateStorage Copy(Other);
 			reset();
-			copyFrom(Other);
+			moveFrom(std::move(Copy));
 		}
 		return *this;
 	}
@@ -115,7 +109,7 @@ public:
 		requires (!IsCopyable)
 		= delete;
 
-	DelegateStorage& operator=(DelegateStorage&& Other)
+	DelegateStorage& operator=(DelegateStorage&& Other) noexcept
 	{
 		if (this != &Other)
 		{
@@ -130,21 +124,21 @@ public:
 		return Invoker != nullptr;
 	}
 
+
 	RetType execute(Args... InArgs) const
 	{
 		if (!Invoker)
 		{
 			throw std::bad_function_call();
 		}
-
-		return Invoker(const_cast<void*>(ObjectPtr), std::forward<Args>(InArgs)...);
+		return Invoker(ObjectPtr, std::forward<Args>(InArgs)...);
 	}
 
 	void reset() noexcept
 	{
-		if (Destroyer && ObjectPtr)
+		if (Ops && Ops->Destroy && ObjectPtr)
 		{
-			Destroyer(ObjectPtr);
+			Ops->Destroy(ObjectPtr);
 		}
 		clearBinding();
 	}
@@ -153,185 +147,297 @@ protected:
 	template <typename Callable>
 	void initFromCallable(Callable&& InCallable)
 	{
-		using DecayedType = std::decay_t<Callable>;
-		static_assert(
-			std::is_invocable_r_v<RetType, DecayedType&, Args...>,
-			"Callable must be invocable with Args... and return RetType"
-		);
+		using CallableType = std::decay_t<Callable>;
+		static_assert(std::is_invocable_r_v<RetType, CallableType&, Args...>, "Callable signature does not match delegate");
 
 		if constexpr (IsCopyable)
 		{
-			static_assert(std::copy_constructible<DecayedType>, "Callable must be copy constructible for delegate");
+			static_assert(std::copy_constructible<CallableType>, "delegate requires a copy-constructible callable");
 		}
 		else
 		{
-			static_assert(std::move_constructible<DecayedType>, "Callable must be move constructible for move_only_delegate");
+			static_assert(std::move_constructible<CallableType>, "move_only_delegate requires a move-constructible callable");
 		}
 
 		reset();
 
-		if constexpr (fitsInline<DecayedType>())
+		if constexpr (fitsInline<CallableType>())
 		{
-			void* Inline = storagePtr();
-			std::construct_at(static_cast<DecayedType*>(Inline), std::forward<Callable>(InCallable));
-
-			ObjectPtr = Inline;
-			Invoker = +[](void* StoragePtr, Args&&... ArgsPack) -> RetType {
-				return std::invoke(*static_cast<DecayedType*>(StoragePtr), std::forward<Args>(ArgsPack)...);
-			};
-
-			Destroyer = +[](void* StoragePtr) {
-				std::destroy_at(static_cast<DecayedType*>(StoragePtr));
-			};
-
-			Mover = +[](void* DestStorage, void* SourceObject) -> void* {
-				auto* Src = static_cast<DecayedType*>(SourceObject);
-				auto* Dst = static_cast<DecayedType*>(DestStorage);
-				std::construct_at(Dst, std::move(*Src));
-				std::destroy_at(Src);
-				return Dst;
-			};
-
-			if constexpr (IsCopyable)
-			{
-				Copier = +[](void* DestStorage, const void* SourceObject) -> void* {
-					auto* Src = static_cast<const DecayedType*>(SourceObject);
-					auto* Dst = static_cast<DecayedType*>(DestStorage);
-					std::construct_at(Dst, *Src);
-					return Dst;
-				};
-			}
+			void* InlineStoragePtr = inlineStorage();
+			std::construct_at(static_cast<CallableType*>(InlineStoragePtr), std::forward<Callable>(InCallable));
+			ObjectPtr = InlineStoragePtr;
+			Invoker = inlineInvoker<CallableType>();
+			Ops = inlineOperations<CallableType>();
 		}
 		else
 		{
-			auto* HeapObj = std::allocator<DecayedType>{}.allocate(1);
-			std::construct_at(HeapObj, std::forward<Callable>(InCallable));
+			auto* HeapObject = std::allocator<CallableType>{}.allocate(1);
 
-			ObjectPtr = HeapObj;
-			Invoker = +[](void* StoragePtr, Args&&... ArgsPack) -> RetType {
-				return std::invoke(*static_cast<DecayedType*>(StoragePtr), std::forward<Args>(ArgsPack)...);
-			};
-
-			Destroyer = +[](void* StoragePtr) {
-				auto* Ptr = static_cast<DecayedType*>(StoragePtr);
-				std::destroy_at(Ptr);
-				std::allocator<DecayedType>{}.deallocate(Ptr, 1);
-			};
-
-			Mover = +[](void*, void* SourceObject) -> void* {
-				return SourceObject;
-			};
-
-			if constexpr (IsCopyable)
+			try
 			{
-				Copier = +[](void*, const void* SourceObject) -> void* {
-					auto* Src = static_cast<const DecayedType*>(SourceObject);
-					auto* Clone = std::allocator<DecayedType>{}.allocate(1);
-					std::construct_at(Clone, *Src);
-					return Clone;
-				};
+				std::construct_at(HeapObject, std::forward<Callable>(InCallable));
 			}
+			catch (...)
+			{
+				std::allocator<CallableType>{}.deallocate(HeapObject, 1);
+				throw;
+			}
+
+			ObjectPtr = HeapObject;
+			Invoker = heapInvoker<CallableType>();
+			Ops = heapOperations<CallableType>();
 		}
 	}
 
 	template <auto Callable>
 	void initFromStaticBinding()
 	{
-		static_assert(std::is_invocable_r_v<RetType, decltype(Callable), Args...>, "Callable signature mismatch");
+		static_assert(std::is_invocable_r_v<RetType, decltype(Callable), Args...>, "Static function signature does not match delegate");
 		reset();
-
 		ObjectPtr = nullptr;
-		Invoker = +[](void*, Args&&... ArgsPack) -> RetType {
-			return std::invoke(Callable, std::forward<Args>(ArgsPack)...);
-		};
-		Destroyer = nullptr;
-		Mover = +[](void*, void* SourceObject) -> void* {
-			return SourceObject;
-		};
-		if constexpr (IsCopyable)
-		{
-			Copier = +[](void*, const void* SourceObject) -> void* {
-				return const_cast<void*>(SourceObject);
-			};
-		}
+		Invoker = staticInvoker<Callable>();
+		Ops = staticOperations<Callable>();
 	}
 
 	template <auto Method, typename ClassType>
 	void initFromRawBinding(ClassType* Instance)
 	{
+		static_assert(std::is_member_function_pointer_v<decltype(Method)>, "Method must be a member-function pointer");
 		reset();
-
 		ObjectPtr = Instance;
-		Invoker = +[](void* StoragePtr, Args&&... ArgsPack) -> RetType {
-			return std::invoke(Method, static_cast<ClassType*>(StoragePtr), std::forward<Args>(ArgsPack)...);
-		};
-		Destroyer = nullptr;
-		Mover = +[](void*, void* SourceObject) -> void* {
-			return SourceObject;
-		};
-		if constexpr (IsCopyable)
-		{
-			Copier = +[](void*, const void* SourceObject) -> void* {
-				return const_cast<void*>(SourceObject);
-			};
-		}
+		Invoker = rawInvoker<Method, ClassType>();
+		Ops = rawOperations<Method, ClassType>();
+	}
+
+	template <auto Method, typename ClassType>
+	void initFromConstRawBinding(const ClassType* Instance)
+	{
+		static_assert(std::is_member_function_pointer_v<decltype(Method)>, "Method must be a member-function pointer");
+		static_assert(std::is_invocable_r_v<RetType, decltype(Method), const ClassType*, Args...>, "Const method signature does not match delegate");
+		reset();
+		ObjectPtr = const_cast<ClassType*>(Instance);
+		Invoker = constRawInvoker<Method, ClassType>();
+		Ops = constRawOperations<Method, ClassType>();
 	}
 
 private:
-	template <typename Ty>
+	template <typename CallableType>
 	static consteval bool fitsInline()
 	{
-		return sizeof(Ty) <= DelegateSmallStorageSize && alignof(Ty) <= alignof(std::max_align_t);
+		if constexpr (EnableSBO)
+		{
+			return sizeof(CallableType) <= DelegateSmallStorageSize
+				&& alignof(CallableType) <= alignof(std::max_align_t)
+				&& std::is_nothrow_move_constructible_v<CallableType>;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	template <typename CallableType>
+	static RetType invokeCallable(CallableType& Callable, Args&&... InArgs)
+	{
+		if constexpr (requires(CallableType& Candidate, Args&&... CandidateArgs) {
+			Candidate(std::forward<Args>(CandidateArgs)...);
+		})
+		{
+			return Callable(std::forward<Args>(InArgs)...);
+		}
+		else
+		{
+			return std::invoke(Callable, std::forward<Args>(InArgs)...);
+		}
+	}
+
+	template <auto Callable>
+	static RetType invokeStatic(Args&&... InArgs)
+	{
+		if constexpr (requires { Callable(std::declval<Args>()...); })
+		{
+			return Callable(std::forward<Args>(InArgs)...);
+		}
+		else
+		{
+			return std::invoke(Callable, std::forward<Args>(InArgs)...);
+		}
+	}
+
+	template <typename CallableType>
+	static InvokerType inlineInvoker()
+	{
+		return +[](void* Object, Args&&... InArgs) -> RetType {
+			return invokeCallable(*static_cast<CallableType*>(Object), std::forward<Args>(InArgs)...);
+		};
+	}
+
+	template <typename CallableType>
+	static InvokerType heapInvoker()
+	{
+		return inlineInvoker<CallableType>();
+	}
+
+	template <auto Callable>
+	static InvokerType staticInvoker()
+	{
+		return +[](void*, Args&&... InArgs) -> RetType {
+			return invokeStatic<Callable>(std::forward<Args>(InArgs)...);
+		};
+	}
+
+	template <auto Method, typename ClassType>
+	static InvokerType rawInvoker()
+	{
+		static_assert(std::is_invocable_r_v<RetType, decltype(Method), ClassType*, Args...>, "Raw method signature does not match delegate");
+		return +[](void* Object, Args&&... InArgs) -> RetType {
+			return (static_cast<ClassType*>(Object)->*Method)(std::forward<Args>(InArgs)...);
+		};
+	}
+
+	template <auto Method, typename ClassType>
+	static InvokerType constRawInvoker()
+	{
+		static_assert(std::is_invocable_r_v<RetType, decltype(Method), const ClassType*, Args...>, "Const raw method signature does not match delegate");
+		return +[](void* Object, Args&&... InArgs) -> RetType {
+			return (static_cast<const ClassType*>(Object)->*Method)(std::forward<Args>(InArgs)...);
+		};
+	}
+
+	template <typename CallableType>
+	static const Operations* inlineOperations()
+	{
+		static const Operations Table{
+			.Destroy = +[](void* Object) noexcept {
+				std::destroy_at(static_cast<CallableType*>(Object));
+			},
+			.Move = +[](void* Destination, void* Source) noexcept -> void* {
+				auto* SourceCallable = static_cast<CallableType*>(Source);
+				auto* DestinationCallable = static_cast<CallableType*>(Destination);
+				std::construct_at(DestinationCallable, std::move(*SourceCallable));
+				std::destroy_at(SourceCallable);
+				return DestinationCallable;
+			},
+			.Copy = copyOperation<CallableType>()
+		};
+		return &Table;
+	}
+
+	template <typename CallableType>
+	static const Operations* heapOperations()
+	{
+		static const Operations Table{
+			.Destroy = +[](void* Object) noexcept {
+				auto* Callable = static_cast<CallableType*>(Object);
+				std::destroy_at(Callable);
+				std::allocator<CallableType>{}.deallocate(Callable, 1);
+			},
+			.Move = +[](void*, void* Source) noexcept -> void* {
+				return Source;
+			},
+			.Copy = heapCopyOperation<CallableType>()
+		};
+		return &Table;
+	}
+
+	template <auto Callable>
+	static const Operations* staticOperations()
+	{
+		static const Operations Table{
+			.Destroy = nullptr,
+			.Move = +[](void*, void*) noexcept -> void* { return nullptr; },
+			.Copy = +[](void*, const void*) -> void* { return nullptr; }
+		};
+		return &Table;
+	}
+
+	template <auto Method, typename ClassType>
+	static const Operations* rawOperations()
+	{
+		static const Operations Table{
+			.Destroy = nullptr,
+			.Move = +[](void*, void* Source) noexcept -> void* { return Source; },
+			.Copy = +[](void*, const void* Source) -> void* { return const_cast<void*>(Source); }
+		};
+		return &Table;
+	}
+
+	template <auto Method, typename ClassType>
+	static const Operations* constRawOperations()
+	{
+		static const Operations Table{
+			.Destroy = nullptr,
+			.Move = +[](void*, void* Source) noexcept -> void* { return Source; },
+			.Copy = +[](void*, const void* Source) -> void* { return const_cast<void*>(Source); }
+		};
+		return &Table;
+	}
+
+	template <typename CallableType>
+	static consteval CopierType copyOperation()
+	{
+		if constexpr (IsCopyable)
+		{
+			return +[](void* Destination, const void* Source) -> void* {
+				auto* DestinationCallable = static_cast<CallableType*>(Destination);
+				std::construct_at(DestinationCallable, *static_cast<const CallableType*>(Source));
+				return DestinationCallable;
+			};
+		}
+		else
+		{
+			return nullptr;
+		}
+	}
+
+	template <typename CallableType>
+	static consteval CopierType heapCopyOperation()
+	{
+		if constexpr (IsCopyable)
+		{
+			return +[](void*, const void* Source) -> void* {
+				auto* Clone = std::allocator<CallableType>{}.allocate(1);
+				try
+				{
+					std::construct_at(Clone, *static_cast<const CallableType*>(Source));
+				}
+				catch (...)
+				{
+					std::allocator<CallableType>{}.deallocate(Clone, 1);
+					throw;
+				}
+				return Clone;
+			};
+		}
+		else
+		{
+			return nullptr;
+		}
 	}
 
 	void copyFrom(const DelegateStorage& Other)
-		requires (IsCopyable)
+		requires IsCopyable
 	{
-		if (!Other.bound())
+		if (!Other.Invoker)
 		{
 			return;
 		}
 
-		void* NewObject = nullptr;
-		if (Other.Copier)
-		{
-			NewObject = Other.Copier(storagePtr(), Other.ObjectPtr);
-		}
-		else
-		{
-			NewObject = const_cast<void*>(Other.ObjectPtr);
-		}
-
-		ObjectPtr = NewObject;
+		ObjectPtr = Other.Ops->Copy(inlineStorage(), Other.ObjectPtr);
 		Invoker = Other.Invoker;
-		Destroyer = Other.Destroyer;
-		Mover = Other.Mover;
-		Copier = Other.Copier;
+		Ops = Other.Ops;
 	}
 
-	void moveFrom(DelegateStorage&& Other)
+	void moveFrom(DelegateStorage&& Other) noexcept
 	{
-		if (!Other.bound())
+		if (!Other.Invoker)
 		{
 			return;
 		}
 
-		void* NewObject = nullptr;
-		if (Other.Mover)
-		{
-			NewObject = Other.Mover(storagePtr(), Other.ObjectPtr);
-		}
-		else
-		{
-			NewObject = Other.ObjectPtr;
-		}
-
-		ObjectPtr = NewObject;
+		ObjectPtr = Other.Ops->Move(inlineStorage(), Other.ObjectPtr);
 		Invoker = Other.Invoker;
-		Destroyer = Other.Destroyer;
-		Mover = Other.Mover;
-		Copier = Other.Copier;
-
+		Ops = Other.Ops;
 		Other.clearBinding();
 	}
 
@@ -339,91 +445,56 @@ private:
 	{
 		ObjectPtr = nullptr;
 		Invoker = nullptr;
-		Destroyer = nullptr;
-		Mover = nullptr;
-		Copier = nullptr;
+		Ops = nullptr;
 	}
 
-	void* storagePtr() noexcept
+	void* inlineStorage() noexcept
 	{
-		return static_cast<void*>(StorageBuffer);
-	}
-
-	const void* storagePtr() const noexcept
-	{
-		return static_cast<const void*>(StorageBuffer);
+		if constexpr (EnableSBO)
+		{
+			return static_cast<void*>(Inline.Buffer);
+		}
+		else
+		{
+			return nullptr;
+		}
 	}
 
 private:
-	alignas(std::max_align_t) std::byte StorageBuffer[DelegateSmallStorageSize]{};
-
+	[[no_unique_address]] InlineStorageType Inline{};
 	void* ObjectPtr = nullptr;
 	InvokerType Invoker = nullptr;
-	DestructorType Destroyer = nullptr;
-	MoveConstructorType Mover = nullptr;
-	CopyConstructorType Copier = nullptr;
+	const Operations* Ops = nullptr;
 };
 } // namespace details
 
-/**
- * @brief Copyable high-performance delegate with SBO and type-safe bindings.
- * @breif Copyable high-performance delegate with SBO and type-safe bindings.
- * @usage
- *   - core::delegate<void, int> d;
- *   - d.bind_static<&OnValue>();
- *   - d.execute(42);
- */
-template <typename RetType, typename ... Args>
-class delegate : public details::DelegateStorage<true, RetType, Args...>
+
+template <typename RetType, bool EnableSBO, typename... Args>
+class basic_delegate : public details::DelegateStorage<true, EnableSBO, RetType, Args...>
 {
-	using Super = details::DelegateStorage<true, RetType, Args...>;
+	using Super = details::DelegateStorage<true, EnableSBO, RetType, Args...>;
 
 public:
 	using Super::bound;
 	using Super::execute;
 	using Super::reset;
 
-	/**
-	 * @brief Creates an empty delegate.
-	 * @breif Creates an empty delegate.
-	 * @usage
-	 *   - core::delegate<void, int> d;
-	 */
-	delegate() noexcept = default;
-	delegate(const delegate&) = default;
-	delegate(delegate&&) = default;
-	delegate& operator=(const delegate&) = default;
-	delegate& operator=(delegate&&) = default;
+	basic_delegate() noexcept = default;
+	basic_delegate(const basic_delegate&) = default;
+	basic_delegate(basic_delegate&&) noexcept = default;
+	basic_delegate& operator=(const basic_delegate&) = default;
+	basic_delegate& operator=(basic_delegate&&) noexcept = default;
 
-	/**
-	 * @brief Constructs a delegate from std::function by copy.
-	 * @breif Constructs a delegate from std::function by copy.
-	 * @usage
-	 *   - std::function<int(int)> fn = [](int v) { return v * 2; };
-	 *   - core::delegate<int, int> d(fn);
-	 */
-	explicit delegate(const std::function<RetType(Args...)>& InFunction)
+	explicit basic_delegate(const std::function<RetType(Args...)>& InFunction)
 	{
 		bind_std_function(InFunction);
 	}
 
-	/**
-	 * @brief Constructs a delegate from std::function by move.
-	 * @breif Constructs a delegate from std::function by move.
-	 * @usage
-	 *   - core::delegate<int, int> d(std::function<int(int)>{[](int v) { return v * 2; }});
-	 */
-	explicit delegate(std::function<RetType(Args...)>&& InFunction)
+	explicit basic_delegate(std::function<RetType(Args...)>&& InFunction)
 	{
 		bind_std_function(std::move(InFunction));
 	}
 
-	/**
-	 * @brief Binds a compile-time free/static callable without owning storage.
-	 * @breif Binds a compile-time free/static callable without owning storage.
-	 * @usage
-	 *   - d.bind_static<&OnValue>();
-	 */
 	template <auto Callable>
 		requires std::is_invocable_r_v<RetType, decltype(Callable), Args...>
 	void bind_static()
@@ -431,44 +502,50 @@ public:
 		Super::template initFromStaticBinding<Callable>();
 	}
 
-	/**
-	 * @brief Binds a member function with a raw instance pointer.
-	 * @breif Binds a member function with a raw instance pointer.
-	 * @usage
-	 *   - Receiver receiver;
-	 *   - d.bind_raw<&Receiver::Handle>(&receiver);
-	 */
 	template <auto Method, typename ClassType>
 		requires std::is_member_function_pointer_v<decltype(Method)>
 	void bind_raw(ClassType* Instance)
 	{
-		if (Instance == nullptr)
+		if (!Instance)
 		{
-			throw std::invalid_argument("delegate::bind_raw requires non-null instance");
+			throw std::invalid_argument("delegate::bind_raw requires a non-null instance");
 		}
 		Super::template initFromRawBinding<Method>(Instance);
 	}
 
-	/**
-	 * @brief Binds a member function via shared_ptr lifetime tracking.
-	 * @breif Binds a member function via shared_ptr lifetime tracking.
-	 * @usage
-	 *   - auto receiver = std::make_shared<Receiver>();
-	 *   - d.bind_shared<&Receiver::Handle>(receiver);
+	template <auto Method, typename ClassType>
+		requires std::is_member_function_pointer_v<decltype(Method)>
+	void bind_raw(const ClassType* Instance)
+	{
+		if (!Instance)
+		{
+			throw std::invalid_argument("delegate::bind_raw requires a non-null instance");
+		}
+		Super::template initFromConstRawBinding<Method>(Instance);
+	}
+
+	/** 
+	 * @brief Binds a member function while strongly owning its shared object. 
+	 * @usage `callback.bind_shared<&Receiver::Handle>(receiver);` 
 	 */
 	template <auto Method, typename ClassType>
 		requires std::is_member_function_pointer_v<decltype(Method)>
-	void bind_shared(const std::shared_ptr<ClassType>& InstancePtr)
+	void bind_shared(std::shared_ptr<ClassType> InstancePtr)
 	{
-		bind_weak<Method>(std::weak_ptr<ClassType>(InstancePtr));
+		if (!InstancePtr)
+		{
+			throw std::invalid_argument("delegate::bind_shared requires a non-null instance");
+		}
+		Super::initFromCallable(
+			[InstancePtr = std::move(InstancePtr)](Args... InArgs) -> RetType {
+				return (InstancePtr.get()->*Method)(std::forward<Args>(InArgs)...);
+			}
+		);
 	}
 
-	/**
-	 * @brief Binds a member function via weak_ptr and throws if object expired.
-	 * @breif Binds a member function via weak_ptr and throws if object expired.
-	 * @usage
-	 *   - std::weak_ptr<Receiver> weak = receiver;
-	 *   - d.bind_weak<&Receiver::Handle>(weak);
+	/** 
+	 * @brief Binds a weak member function and validates lifetime at invoke time. 
+	 * @usage `callback.bind_weak<&Receiver::Handle>(weak_receiver);` 
 	 */
 	template <auto Method, typename ClassType>
 		requires std::is_member_function_pointer_v<decltype(Method)>
@@ -481,16 +558,14 @@ public:
 				{
 					throw std::bad_function_call();
 				}
-				return std::invoke(Method, Shared.get(), std::forward<Args>(InArgs)...);
+				return (Shared.get()->*Method)(std::forward<Args>(InArgs)...);
 			}
 		);
 	}
 
-	/**
-	 * @brief Binds a copy-constructible callable object.
-	 * @breif Binds a copy-constructible callable object.
-	 * @usage
-	 *   - d.bind_lambda([factor = 2](int v) { return v * factor; });
+	/** 
+	 * @brief Binds a copyable callable object. 
+	 * @usage `callback.bind_lambda([factor = 2](int value) { return value * factor; });` 
 	 */
 	template <typename Callable>
 		requires std::is_invocable_r_v<RetType, std::decay_t<Callable>&, Args...>
@@ -500,52 +575,43 @@ public:
 		Super::initFromCallable(std::forward<Callable>(InCallable));
 	}
 
-	/**
-	 * @brief Binds from std::function by copy for interoperability.
-	 * @breif Binds from std::function by copy for interoperability.
-	 * @usage
-	 *   - std::function<void(int)> fn = [](int) {};
-	 *   - d.bind_std_function(fn);
+	/** 
+	 * @brief Binds std::function by copy for interoperability. 
+	 * @usage `callback.bind_std_function(fn);` 
 	 */
 	void bind_std_function(const std::function<RetType(Args...)>& InFunction)
 	{
 		Super::initFromCallable(InFunction);
 	}
 
-	/**
-	 * @brief Binds from std::function by move for interoperability.
-	 * @breif Binds from std::function by move for interoperability.
-	 * @usage
-	 *   - d.bind_std_function(std::function<void(int)>{[](int) {}});
+	/** 
+	 * @brief Binds std::function by move for interoperability. 
+	 * @usage `callback.bind_std_function(std::move(fn));` 
 	 */
 	void bind_std_function(std::function<RetType(Args...)>&& InFunction)
 	{
 		Super::initFromCallable(std::move(InFunction));
 	}
 
-	/**
+	/** 
 	 * @brief Exports this delegate as std::function.
-	 * @breif Exports this delegate as std::function.
-	 * @usage
-	 *   - std::function<int(int)> fn = d.as_std_function();
+	 * @usage `std::function<int(int)> fn = callback.as_std_function();` 
 	 */
 	[[nodiscard]] std::function<RetType(Args...)> as_std_function() const&
 	{
-		delegate Copy = *this;
+		basic_delegate Copy = *this;
 		return [Copy = std::move(Copy)](Args... InArgs) mutable -> RetType {
 			return Copy.execute(std::forward<Args>(InArgs)...);
 		};
 	}
 
-	/**
-	 * @brief Moves this delegate into std::move_only_function.
-	 * @breif Moves this delegate into std::move_only_function.
-	 * @usage
-	 *   - auto fn = std::move(d).as_std_move_only_function();
+	/** 
+	 * @brief Moves this delegate into std::move_only_function. 
+	 * @usage `auto fn = std::move(callback).as_std_move_only_function();` 
 	 */
 	[[nodiscard]] std::move_only_function<RetType(Args...)> as_std_move_only_function() &&
 	{
-		delegate Moved = std::move(*this);
+		basic_delegate Moved = std::move(*this);
 		return [Moved = std::move(Moved)](Args... InArgs) mutable -> RetType {
 			return Moved.execute(std::forward<Args>(InArgs)...);
 		};
@@ -553,48 +619,41 @@ public:
 };
 
 /**
- * @brief Move-only high-performance delegate with SBO and type-safe bindings.
- * @breif Move-only high-performance delegate with SBO and type-safe bindings.
- * @usage
- *   - core::move_only_delegate<void, int> d;
- *   - d.bind_lambda([state = std::make_unique<int>(1)](int) mutable { ++(*state); });
+ * @brief Copyable high-performance delegate with SBO disabled by default.
+ * @breif Copyable high-performance delegate with SBO disabled by default.
+ * @usage `core::delegate<int, int> callback;`
  */
-template <typename RetType, typename ... Args>
-class move_only_delegate : public details::DelegateStorage<false, RetType, Args...>
+template <typename RetType, typename... Args>
+using delegate = basic_delegate<RetType, false, Args...>;
+
+/**
+ * @brief Move-only high-performance delegate with configurable SBO and direct static/raw trampolines.
+ * @breif Move-only high-performance delegate with configurable SBO and direct static/raw trampolines.
+ * @usage
+ *   - core::basic_move_only_delegate<int, true, int> callback;
+ *   - callback.bind_lambda([value = std::make_unique<int>(1)](int input) { return *value + input; });
+ */
+template <typename RetType, bool EnableSBO, typename... Args>
+class basic_move_only_delegate : public details::DelegateStorage<false, EnableSBO, RetType, Args...>
 {
-	using Super = details::DelegateStorage<false, RetType, Args...>;
+	using Super = details::DelegateStorage<false, EnableSBO, RetType, Args...>;
 
 public:
 	using Super::bound;
 	using Super::execute;
 	using Super::reset;
 
-	/**
-	 * @breif Creates an empty move-only delegate.
-	 * @usage
-	 *   - core::move_only_delegate<void, int> d;
-	 */
-	move_only_delegate() noexcept = default;
-	move_only_delegate(const move_only_delegate&) = delete;
-	move_only_delegate& operator=(const move_only_delegate&) = delete;
-	move_only_delegate(move_only_delegate&&) = default;
-	move_only_delegate& operator=(move_only_delegate&&) = default;
+	basic_move_only_delegate() noexcept = default;
+	basic_move_only_delegate(const basic_move_only_delegate&) = delete;
+	basic_move_only_delegate& operator=(const basic_move_only_delegate&) = delete;
+	basic_move_only_delegate(basic_move_only_delegate&&) noexcept = default;
+	basic_move_only_delegate& operator=(basic_move_only_delegate&&) noexcept = default;
 
-	/**
-	 * @breif Constructs a move-only delegate from std::move_only_function.
-	 * @usage
-	 *   - core::move_only_delegate<int, int> d(std::move(std::move_only_function<int(int)>{...}));
-	 */
-	explicit move_only_delegate(std::move_only_function<RetType(Args...)>&& InFunction)
+	explicit basic_move_only_delegate(std::move_only_function<RetType(Args...)>&& InFunction)
 	{
 		bind_std_move_only_function(std::move(InFunction));
 	}
 
-	/**
-	 * @breif Binds a compile-time free/static callable without owning storage.
-	 * @usage
-	 *   - d.bind_static<&OnValue>();
-	 */
 	template <auto Callable>
 		requires std::is_invocable_r_v<RetType, decltype(Callable), Args...>
 	void bind_static()
@@ -602,41 +661,54 @@ public:
 		Super::template initFromStaticBinding<Callable>();
 	}
 
-	/**
-	 * @breif Binds a member function with a raw instance pointer.
-	 * @usage
-	 *   - Receiver receiver;
-	 *   - d.bind_raw<&Receiver::Handle>(&receiver);
-	 */
 	template <auto Method, typename ClassType>
 		requires std::is_member_function_pointer_v<decltype(Method)>
 	void bind_raw(ClassType* Instance)
 	{
-		if (Instance == nullptr)
+		if (!Instance)
 		{
-			throw std::invalid_argument("move_only_delegate::bind_raw requires non-null instance");
+			throw std::invalid_argument("move_only_delegate::bind_raw requires a non-null instance");
 		}
 		Super::template initFromRawBinding<Method>(Instance);
 	}
 
-	/**
-	 * @breif Binds a member function via shared_ptr lifetime tracking.
-	 * @usage
-	 *   - auto receiver = std::make_shared<Receiver>();
-	 *   - d.bind_shared<&Receiver::Handle>(receiver);
+	/** 
+	 * @brief Binds a const member function and const raw instance. 
+	 * @usage `callback.bind_raw<&Receiver::Read>(&receiver);` 
 	 */
 	template <auto Method, typename ClassType>
 		requires std::is_member_function_pointer_v<decltype(Method)>
-	void bind_shared(const std::shared_ptr<ClassType>& InstancePtr)
+	void bind_raw(const ClassType* Instance)
 	{
-		bind_weak<Method>(std::weak_ptr<ClassType>(InstancePtr));
+		if (!Instance)
+		{
+			throw std::invalid_argument("move_only_delegate::bind_raw requires a non-null instance");
+		}
+		Super::template initFromConstRawBinding<Method>(Instance);
 	}
 
-	/**
-	 * @breif Binds a member function via weak_ptr and throws if object expired.
-	 * @usage
-	 *   - std::weak_ptr<Receiver> weak = receiver;
-	 *   - d.bind_weak<&Receiver::Handle>(weak);
+	/** 
+	 * @brief Binds a member function while strongly owning its shared object. 
+	 * @usage `callback.bind_shared<&Receiver::Handle>(receiver);` 
+	 */
+	template <auto Method, typename ClassType>
+		requires std::is_member_function_pointer_v<decltype(Method)>
+	void bind_shared(std::shared_ptr<ClassType> InstancePtr)
+	{
+		if (!InstancePtr)
+		{
+			throw std::invalid_argument("move_only_delegate::bind_shared requires a non-null instance");
+		}
+		Super::initFromCallable(
+			[InstancePtr = std::move(InstancePtr)](Args... InArgs) -> RetType {
+				return (InstancePtr.get()->*Method)(std::forward<Args>(InArgs)...);
+			}
+		);
+	}
+
+	/** 
+	 * @brief Binds a weak member function and validates lifetime at invoke time. 
+	 * @usage `callback.bind_weak<&Receiver::Handle>(weak_receiver);` 
 	 */
 	template <auto Method, typename ClassType>
 		requires std::is_member_function_pointer_v<decltype(Method)>
@@ -649,15 +721,14 @@ public:
 				{
 					throw std::bad_function_call();
 				}
-				return std::invoke(Method, Shared.get(), std::forward<Args>(InArgs)...);
+				return (Shared.get()->*Method)(std::forward<Args>(InArgs)...);
 			}
 		);
 	}
 
-	/**
-	 * @breif Binds a move-constructible callable object.
-	 * @usage
-	 *   - d.bind_lambda([state = std::make_unique<int>(1)](int v) { return *state + v; });
+	/** 
+	 * @brief Binds a move-constructible callable object. 
+	 * @usage `callback.bind_lambda([value = std::make_unique<int>(1)](int input) { return *value + input; });` 
 	 */
 	template <typename Callable>
 		requires std::is_invocable_r_v<RetType, std::decay_t<Callable>&, Args...>
@@ -667,249 +738,405 @@ public:
 		Super::initFromCallable(std::forward<Callable>(InCallable));
 	}
 
-	/**
-	 * @breif Binds from std::move_only_function for interoperability.
-	 * @usage
-	 *   - std::move_only_function<void(int)> fn = [](int) {};
-	 *   - d.bind_std_move_only_function(std::move(fn));
+	/** 
+	 * @brief Binds std::move_only_function for interoperability. 
+	 * @usage `callback.bind_std_move_only_function(std::move(fn));` 
 	 */
 	void bind_std_move_only_function(std::move_only_function<RetType(Args...)>&& InFunction)
 	{
 		Super::initFromCallable(std::move(InFunction));
 	}
 
-	/**
-	 * @breif Moves this delegate into std::move_only_function.
-	 * @usage
-	 *   - auto fn = std::move(d).as_std_move_only_function();
+	/** 
+	 * @brief Moves this delegate into std::move_only_function. 
+	 * @usage `auto fn = std::move(callback).as_std_move_only_function();` 
 	 */
 	[[nodiscard]] std::move_only_function<RetType(Args...)> as_std_move_only_function() &&
 	{
-		move_only_delegate Moved = std::move(*this);
+		basic_move_only_delegate Moved = std::move(*this);
 		return [Moved = std::move(Moved)](Args... InArgs) mutable -> RetType {
 			return Moved.execute(std::forward<Args>(InArgs)...);
 		};
 	}
 };
 
+/**
+ * @brief Move-only high-performance delegate with SBO disabled by default.
+ * @breif Move-only high-performance delegate with SBO disabled by default.
+ * @usage `core::move_only_delegate<int, int> callback;`
+ */
+template <typename RetType, typename... Args>
+using move_only_delegate = basic_move_only_delegate<RetType, false, Args...>;
+
 template <typename Ty>
 class multicast_delegate;
 
 /**
- * @breif Multi-cast delegate storing multiple callbacks under DelegateHandle ids.
+ * @brief Ordered multicast delegate with generation-safe reusable handles and mutation-safe broadcasting.
  * @usage
- *   - core::multicast_delegate<void(int)> onValue;
- *   - auto handle = onValue.add_lambda([](int) {});
- *   - onValue.broadcast(3);
+ *   - core::multicast_delegate<void(int)> callbacks;
+ *   - const auto handle = callbacks.add_lambda([](int) {});
+ *   - callbacks.broadcast(42);
+ *   - callbacks.remove(handle);
  */
-template <typename RetType, typename ... Args>
-class multicast_delegate <RetType(Args...)>
+template <typename RetType, typename... Args>
+class multicast_delegate<RetType(Args...)>
 {
 	using DelegateType = delegate<RetType, Args...>;
+	static constexpr std::uint32_t InvalidSlot = std::numeric_limits<std::uint32_t>::max();
+	static constexpr bool SupportsFanoutArguments = (
+		...
+		&& (!std::is_rvalue_reference_v<Args>
+			&& (std::is_reference_v<Args> || std::copy_constructible<Args>))
+	);
 
-	struct DelegateEntry
+	struct Slot
 	{
-		DelegateHandle Handle;
-		DelegateType Delegate;
+		DelegateType Callback;
+		std::uint32_t Generation = 1;
+		std::uint32_t NextFree = InvalidSlot;
+		bool Active = false;
+	};
+
+	struct OrderedSlot
+	{
+		std::uint32_t Index = InvalidSlot;
+		std::uint32_t Generation = 0;
 	};
 
 public:
-	/**
-	 * @breif Adds a delegate by move and returns its registration handle.
-	 * @usage
-	 *   - core::delegate<void, int> d;
-	 *   - auto h = multicast.add(std::move(d));
-	 */
+	multicast_delegate() = default;
+	multicast_delegate(const multicast_delegate&) = default;
+	multicast_delegate(multicast_delegate&&) = default;
+	multicast_delegate& operator=(const multicast_delegate&) = default;
+	multicast_delegate& operator=(multicast_delegate&&) = default;
+
 	DelegateHandle add(DelegateType&& InDelegate)
 	{
-		DelegateHandle Handle;
-		Handle.Id = NextHandleId++;
-		Delegates.push_back(DelegateEntry{Handle, std::move(InDelegate)});
-		return Handle;
+		const std::uint32_t SlotIndex = acquireSlot();
+		Slot& Entry = Slots[SlotIndex];
+		try
+		{
+			Order.push_back(OrderedSlot{SlotIndex, Entry.Generation});
+		}
+		catch (...)
+		{
+			releaseUnboundSlot(SlotIndex);
+			throw;
+		}
+
+		Entry.Callback = std::move(InDelegate);
+		Entry.Active = true;
+		++ActiveCount;
+		return makeHandle(SlotIndex, Entry.Generation);
 	}
 
-	/**
-	 * @breif Adds a delegate by copy and returns its registration handle.
-	 * @usage
-	 *   - core::delegate<void, int> d;
-	 *   - auto h = multicast.add(d);
-	 */
 	DelegateHandle add(const DelegateType& InDelegate)
 	{
-		DelegateHandle Handle;
-		Handle.Id = NextHandleId++;
-		Delegates.push_back(DelegateEntry{Handle, InDelegate});
-		return Handle;
+		DelegateType Copy(InDelegate);
+		return add(std::move(Copy));
 	}
 
-	/**
-	 * @breif Adds a raw member-function binding and returns its handle.
-	 * @usage
-	 *   - auto h = multicast.add_raw<&Receiver::Handle>(&receiver);
-	 */
 	template <auto Method, typename ClassType>
 	DelegateHandle add_raw(ClassType* Instance)
 	{
-		DelegateType Bound;
-		Bound.template bind_raw<Method>(Instance);
-		return add(std::move(Bound));
+		DelegateType Callback;
+		Callback.template bind_raw<Method>(Instance);
+		return add(std::move(Callback));
 	}
 
-	/**
-	 * @brief Adds a static/free function binding and returns its handle.
-	 * @usage
-	 *   - auto h = multicast.add_static<&OnValue>();
+	template <auto Method, typename ClassType>
+	DelegateHandle add_raw(const ClassType* Instance)
+	{
+		DelegateType Callback;
+		Callback.template bind_raw<Method>(Instance);
+		return add(std::move(Callback));
+	}
+
+	/** 
+	 * @brief Adds a static/free function binding. 
+	 * @usage `callbacks.add_static<&OnValue>();` 
 	 */
-	template <auto FunctionType>
+	template <auto Callable>
 	DelegateHandle add_static()
 	{
-		DelegateType Bound;
-		Bound.template bind_static<FunctionType>();
-		return add(std::move(Bound));
+		DelegateType Callback;
+		Callback.template bind_static<Callable>();
+		return add(std::move(Callback));
 	}
 
-	/**
-	 * @breif Adds a shared_ptr-tracked member-function binding and returns its handle.
-	 * @usage
-	 *   - auto h = multicast.add_shared<&Receiver::Handle>(receiver);
+	/** 
+	 * @brief Adds a shared_ptr-owned member-function binding. 
+	 * @usage `callbacks.add_shared<&Receiver::Handle>(receiver);` 
 	 */
 	template <auto Method, typename ClassType>
-	DelegateHandle add_shared(const std::shared_ptr<ClassType>& InstancePtr)
+	DelegateHandle add_shared(std::shared_ptr<ClassType> InstancePtr)
 	{
-		DelegateType Bound;
-		Bound.template bind_shared<Method>(InstancePtr);
-		return add(std::move(Bound));
+		DelegateType Callback;
+		Callback.template bind_shared<Method>(std::move(InstancePtr));
+		return add(std::move(Callback));
 	}
 
-	/**
-	 * @breif Adds a weak_ptr-tracked member-function binding and returns its handle.
-	 * @usage
-	 *   - auto h = multicast.add_weak<&Receiver::Handle>(weak_receiver);
+	/** 
+	 * @brief Adds a weak_ptr member-function binding. 
+	 * @usage `callbacks.add_weak<&Receiver::Handle>(weak_receiver);` 
 	 */
 	template <auto Method, typename ClassType>
 	DelegateHandle add_weak(const std::weak_ptr<ClassType>& InstanceWeakPtr)
 	{
-		DelegateType Bound;
-		Bound.template bind_weak<Method>(InstanceWeakPtr);
-		return add(std::move(Bound));
+		DelegateType Callback;
+		Callback.template bind_weak<Method>(InstanceWeakPtr);
+		return add(std::move(Callback));
 	}
 
-	/**
-	 * @breif Adds a callable/lambda binding and returns its handle.
-	 * @usage
-	 *   - auto h = multicast.add_lambda([](int v) { return v + 1; });
+	/** 
+	 * @brief Adds a copyable lambda/callable binding. 
+	 * @usage `callbacks.add_lambda([](int value) { return value + 1; });` 
 	 */
 	template <typename Callable>
 	DelegateHandle add_lambda(Callable&& InCallable)
 	{
-		DelegateType Bound;
-		Bound.bind_lambda(std::forward<Callable>(InCallable));
-		return add(std::move(Bound));
+		DelegateType Callback;
+		Callback.bind_lambda(std::forward<Callable>(InCallable));
+		return add(std::move(Callback));
 	}
 
-	/**
-	 * @breif Removes a callback by handle.
-	 * @usage
-	 *   - bool removed = multicast.remove(handle);
+	/** 
+	 * @brief Marks a callback removed in amortized O(1) time. 
+	 * @usage `callbacks.remove(handle);` 
 	 */
 	bool remove(const DelegateHandle& Handle)
 	{
-		auto It = std::find_if(
-			Delegates.begin(),
-			Delegates.end(),
-			[&](const DelegateEntry& Entry) {
-				return Entry.Handle == Handle;
-			}
-		);
-
-		if (It == Delegates.end())
+		if (!contains(Handle))
 		{
 			return false;
 		}
 
-		Delegates.erase(It);
+		const std::uint32_t SlotIndex = slotIndex(Handle);
+		retireSlot(SlotIndex);
+
+		if (BroadcastDepth == 0)
+		{
+			finalizeRetiredSlots();
+		}
 		return true;
 	}
 
-	/**
-	 * @brief Returns whether the handle is currently registered.
-	 * @usage
-	 *   - if (multicast.contains(handle)) { handle is still active; }
+	/** 
+	 * @brief Checks whether a handle refers to an active callback. 
+	 * @usage `if (callbacks.contains(handle)) callbacks.remove(handle);` 
 	 */
-	[[nodiscard]] bool contains(const DelegateHandle& Handle) const
+	[[nodiscard]] bool contains(const DelegateHandle& Handle) const noexcept
 	{
-		return std::find_if(
-			Delegates.begin(),
-			Delegates.end(),
-			[&](const DelegateEntry& Entry) {
-				return Entry.Handle == Handle;
-			}
-		) != Delegates.end();
+		return Handle.isValid()
+			&& isActive(slotIndex(Handle), generation(Handle));
 	}
 
-	/**
-	 * @brief Clears all registered callbacks.
-	 * @usage
-	 *   - multicast.clear();
-	 */
 	void clear()
 	{
-		Delegates.clear();
-	}
-
-	/**
-	 * @brief Returns true when at least one callback is registered.
-	 * @usage
-	 *   - if (multicast.bound()) { multicast.broadcast(value); }
-	 */
-	[[nodiscard]] bool bound() const noexcept
-	{
-		return !Delegates.empty();
-	}
-
-	/**
-	 * @breif Returns the number of registered callbacks.
-	 * @usage
-	 *   - std::size_t count = multicast.size();
-	 */
-	[[nodiscard]] std::size_t size() const noexcept
-	{
-		return Delegates.size();
-	}
-
-	/**
-	 * @breif Broadcasts arguments to all delegates for void signatures.
-	 * @usage
-	 *   - multicast.broadcast(42);
-	 */
-	void broadcast(Args... InArgs) const
-		requires std::is_void_v<RetType>
-	{
-		for (const auto& Entry : Delegates)
+		for (const OrderedSlot& Entry : Order)
 		{
-			Entry.Delegate.execute(std::forward<Args>(InArgs)...);
+			if (isActive(Entry.Index, Entry.Generation))
+			{
+				retireSlot(Entry.Index);
+			}
+		}
+		if (BroadcastDepth == 0)
+		{
+			finalizeRetiredSlots();
 		}
 	}
 
-	/**
-	 * @breif Invokes all delegates and collects return values for non-void signatures.
-	 * @usage
-	 *   - std::vector<int> values = multicast.collect(42);
+	[[nodiscard]] bool bound() const noexcept
+	{
+		return ActiveCount != 0;
+	}
+
+	[[nodiscard]] std::size_t size() const noexcept
+	{
+		return ActiveCount;
+	}
+
+	/** 
+	 * @brief Broadcasts to callbacks in registration order and permits deferred add/remove. Value arguments are copied per callback; rvalue-reference signatures are unsupported. 
+	 * @usage `callbacks.broadcast(42);` 
+	 */
+	void broadcast(Args... InArgs) const
+		requires std::is_void_v<RetType> && SupportsFanoutArguments
+	{
+		BroadcastScope Scope(*this);
+		const std::size_t InitialOrderSize = Order.size();
+		for (std::size_t OrderIndex = 0; OrderIndex < InitialOrderSize; ++OrderIndex)
+		{
+			const OrderedSlot Entry = Order[OrderIndex];
+			if (isActive(Entry.Index, Entry.Generation))
+			{
+				Slots[Entry.Index].Callback.execute(InArgs...);
+			}
+		}
+	}
+
+	/** 
+	 * @brief Invokes callbacks in registration order and collects non-void results. Value arguments are copied per callback; rvalue-reference signatures are unsupported. 
+	 * @usage `auto values = callbacks.collect(42);` 
 	 */
 	[[nodiscard]] std::vector<RetType> collect(Args... InArgs) const
-		requires (!std::is_void_v<RetType>)
+		requires (!std::is_void_v<RetType>) && SupportsFanoutArguments
 	{
+		BroadcastScope Scope(*this);
 		std::vector<RetType> Results;
-		Results.reserve(Delegates.size());
-		for (const auto& Entry : Delegates)
+		Results.reserve(ActiveCount);
+		const std::size_t InitialOrderSize = Order.size();
+		for (std::size_t OrderIndex = 0; OrderIndex < InitialOrderSize; ++OrderIndex)
 		{
-			Results.push_back(Entry.Delegate.execute(std::forward<Args>(InArgs)...));
+			const OrderedSlot Entry = Order[OrderIndex];
+			if (isActive(Entry.Index, Entry.Generation))
+			{
+				Results.push_back(Slots[Entry.Index].Callback.execute(InArgs...));
+			}
 		}
 		return Results;
 	}
 
 private:
-	std::vector<DelegateEntry> Delegates;
-	uint64_t NextHandleId = 1;
+	class BroadcastScope
+	{
+	public:
+		explicit BroadcastScope(const multicast_delegate& Owner) noexcept
+			: OwnerRef(Owner)
+		{
+			++OwnerRef.BroadcastDepth;
+		}
+
+		~BroadcastScope() noexcept
+		{
+			if (--OwnerRef.BroadcastDepth == 0)
+			{
+				OwnerRef.finalizeRetiredSlots();
+			}
+		}
+
+	private:
+		const multicast_delegate& OwnerRef;
+	};
+
+	[[nodiscard]] static constexpr DelegateHandle makeHandle(std::uint32_t SlotIndex, std::uint32_t Generation) noexcept
+	{
+		return DelegateHandle{
+			(static_cast<std::uint64_t>(Generation) << 32) | (static_cast<std::uint64_t>(SlotIndex) + 1)
+		};
+	}
+
+	[[nodiscard]] static constexpr std::uint32_t slotIndex(const DelegateHandle& Handle) noexcept
+	{
+		return static_cast<std::uint32_t>(Handle.Id) - 1;
+	}
+
+	[[nodiscard]] static constexpr std::uint32_t generation(const DelegateHandle& Handle) noexcept
+	{
+		return static_cast<std::uint32_t>(Handle.Id >> 32);
+	}
+
+	[[nodiscard]] bool isActive(std::uint32_t SlotIndex, std::uint32_t Generation) const noexcept
+	{
+		return SlotIndex < Slots.size()
+			&& Slots[SlotIndex].Active
+			&& Slots[SlotIndex].Generation == Generation;
+	}
+
+	void retireSlot(std::uint32_t SlotIndex) noexcept
+	{
+		Slot& Entry = Slots[SlotIndex];
+		Entry.Active = false;
+		Entry.Generation = nextGeneration(Entry.Generation);
+		Entry.NextFree = RetiredHead;
+		RetiredHead = SlotIndex;
+		--ActiveCount;
+		++TombstoneCount;
+	}
+
+	void releaseUnboundSlot(std::uint32_t SlotIndex) noexcept
+	{
+		Slot& Entry = Slots[SlotIndex];
+		Entry.NextFree = FreeHead;
+		FreeHead = SlotIndex;
+	}
+
+	void releaseRetiredSlots() const noexcept
+	{
+		while (RetiredHead != InvalidSlot)
+		{
+			const std::uint32_t SlotIndex = RetiredHead;
+			Slot& Entry = Slots[SlotIndex];
+			RetiredHead = Entry.NextFree;
+			Entry.Callback.reset();
+			Entry.NextFree = FreeHead;
+			FreeHead = SlotIndex;
+		}
+	}
+
+	[[nodiscard]] bool shouldCompactOrder() const noexcept
+	{
+		return ActiveCount == 0
+			|| (TombstoneCount >= 16 && TombstoneCount * 2 >= Order.size());
+	}
+
+	void finalizeRetiredSlots() const noexcept
+	{
+		releaseRetiredSlots();
+		if (shouldCompactOrder())
+		{
+			compactOrder();
+		}
+	}
+
+	[[nodiscard]] std::uint32_t acquireSlot()
+	{
+		if (FreeHead != InvalidSlot)
+		{
+			const std::uint32_t SlotIndex = FreeHead;
+			FreeHead = Slots[SlotIndex].NextFree;
+			Slots[SlotIndex].NextFree = InvalidSlot;
+			return SlotIndex;
+		}
+
+		if (Slots.size() >= std::numeric_limits<std::uint32_t>::max())
+		{
+			throw std::length_error("multicast_delegate slot capacity exhausted");
+		}
+
+		Slots.emplace_back();
+		return static_cast<std::uint32_t>(Slots.size() - 1);
+	}
+
+	static constexpr std::uint32_t nextGeneration(std::uint32_t Current) noexcept
+	{
+		++Current;
+		return Current == 0 ? 1 : Current;
+	}
+
+	void compactOrder() const noexcept
+	{
+		Order.erase(
+			std::remove_if(
+				Order.begin(),
+				Order.end(),
+				[this](const OrderedSlot& Entry) {
+					return !isActive(Entry.Index, Entry.Generation);
+				}
+			),
+			Order.end()
+		);
+		TombstoneCount = 0;
+	}
+
+private:
+	mutable std::deque<Slot> Slots;
+	mutable std::vector<OrderedSlot> Order;
+	mutable std::uint32_t FreeHead = InvalidSlot;
+	mutable std::uint32_t RetiredHead = InvalidSlot;
+	mutable std::size_t ActiveCount = 0;
+	mutable std::size_t BroadcastDepth = 0;
+	mutable std::size_t TombstoneCount = 0;
 };
 } // namespace core
