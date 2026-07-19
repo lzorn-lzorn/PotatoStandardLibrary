@@ -265,7 +265,7 @@ private:
 	}
 
 	template <typename CallableType>
-	static InvokerType inlineInvoker()
+	static InvokerType gitinlineInvoker()
 	{
 		return +[](void* Object, Args&&... InArgs) -> RetType {
 			return invokeCallable(*static_cast<CallableType*>(Object), std::forward<Args>(InArgs)...);
@@ -466,31 +466,30 @@ private:
 	InvokerType Invoker = nullptr;
 	const Operations* Ops = nullptr;
 };
-} // namespace details
 
 
 template <typename RetType, bool EnableSBO, typename... Args>
-class basic_delegate : public details::DelegateStorage<true, EnableSBO, RetType, Args...>
+class DelegateBase : public DelegateStorage<true, EnableSBO, RetType, Args...>
 {
-	using Super = details::DelegateStorage<true, EnableSBO, RetType, Args...>;
+	using Super = DelegateStorage<true, EnableSBO, RetType, Args...>;
 
 public:
 	using Super::bound;
 	using Super::execute;
 	using Super::reset;
 
-	basic_delegate() noexcept = default;
-	basic_delegate(const basic_delegate&) = default;
-	basic_delegate(basic_delegate&&) noexcept = default;
-	basic_delegate& operator=(const basic_delegate&) = default;
-	basic_delegate& operator=(basic_delegate&&) noexcept = default;
+	DelegateBase() noexcept = default;
+	DelegateBase(const DelegateBase&) = default;
+	DelegateBase(DelegateBase&&) noexcept = default;
+	DelegateBase& operator=(const DelegateBase&) = default;
+	DelegateBase& operator=(DelegateBase&&) noexcept = default;
 
-	explicit basic_delegate(const std::function<RetType(Args...)>& InFunction)
+	explicit DelegateBase(const std::function<RetType(Args...)>& InFunction)
 	{
 		bind_std_function(InFunction);
 	}
 
-	explicit basic_delegate(std::function<RetType(Args...)>&& InFunction)
+	explicit DelegateBase(std::function<RetType(Args...)>&& InFunction)
 	{
 		bind_std_function(std::move(InFunction));
 	}
@@ -599,7 +598,7 @@ public:
 	 */
 	[[nodiscard]] std::function<RetType(Args...)> as_std_function() const&
 	{
-		basic_delegate Copy = *this;
+		DelegateBase Copy = *this;
 		return [Copy = std::move(Copy)](Args... InArgs) mutable -> RetType {
 			return Copy.execute(std::forward<Args>(InArgs)...);
 		};
@@ -611,7 +610,7 @@ public:
 	 */
 	[[nodiscard]] std::move_only_function<RetType(Args...)> as_std_move_only_function() &&
 	{
-		basic_delegate Moved = std::move(*this);
+		DelegateBase Moved = std::move(*this);
 		return [Moved = std::move(Moved)](Args... InArgs) mutable -> RetType {
 			return Moved.execute(std::forward<Args>(InArgs)...);
 		};
@@ -619,37 +618,28 @@ public:
 };
 
 /**
- * @brief Copyable high-performance delegate with SBO disabled by default.
- * @breif Copyable high-performance delegate with SBO disabled by default.
- * @usage `core::delegate<int, int> callback;`
- */
-template <typename RetType, typename... Args>
-using delegate = basic_delegate<RetType, false, Args...>;
-
-/**
  * @brief Move-only high-performance delegate with configurable SBO and direct static/raw trampolines.
- * @breif Move-only high-performance delegate with configurable SBO and direct static/raw trampolines.
  * @usage
- *   - core::basic_move_only_delegate<int, true, int> callback;
+ *   - core::MoveOnlyDelegateBase<int, true, int> callback;
  *   - callback.bind_lambda([value = std::make_unique<int>(1)](int input) { return *value + input; });
  */
 template <typename RetType, bool EnableSBO, typename... Args>
-class basic_move_only_delegate : public details::DelegateStorage<false, EnableSBO, RetType, Args...>
+class MoveOnlyDelegateBase : public DelegateStorage<false, EnableSBO, RetType, Args...>
 {
-	using Super = details::DelegateStorage<false, EnableSBO, RetType, Args...>;
+	using Super = DelegateStorage<false, EnableSBO, RetType, Args...>;
 
 public:
 	using Super::bound;
 	using Super::execute;
 	using Super::reset;
 
-	basic_move_only_delegate() noexcept = default;
-	basic_move_only_delegate(const basic_move_only_delegate&) = delete;
-	basic_move_only_delegate& operator=(const basic_move_only_delegate&) = delete;
-	basic_move_only_delegate(basic_move_only_delegate&&) noexcept = default;
-	basic_move_only_delegate& operator=(basic_move_only_delegate&&) noexcept = default;
+	MoveOnlyDelegateBase() noexcept = default;
+	MoveOnlyDelegateBase(const MoveOnlyDelegateBase&) = delete;
+	MoveOnlyDelegateBase& operator=(const MoveOnlyDelegateBase&) = delete;
+	MoveOnlyDelegateBase(MoveOnlyDelegateBase&&) noexcept = default;
+	MoveOnlyDelegateBase& operator=(MoveOnlyDelegateBase&&) noexcept = default;
 
-	explicit basic_move_only_delegate(std::move_only_function<RetType(Args...)>&& InFunction)
+	explicit MoveOnlyDelegateBase(std::move_only_function<RetType(Args...)>&& InFunction)
 	{
 		bind_std_move_only_function(std::move(InFunction));
 	}
@@ -753,20 +743,20 @@ public:
 	 */
 	[[nodiscard]] std::move_only_function<RetType(Args...)> as_std_move_only_function() &&
 	{
-		basic_move_only_delegate Moved = std::move(*this);
+		MoveOnlyDelegateBase Moved = std::move(*this);
 		return [Moved = std::move(Moved)](Args... InArgs) mutable -> RetType {
 			return Moved.execute(std::forward<Args>(InArgs)...);
 		};
 	}
 };
 
-/**
- * @brief Move-only high-performance delegate with SBO disabled by default.
- * @breif Move-only high-performance delegate with SBO disabled by default.
- * @usage `core::move_only_delegate<int, int> callback;`
- */
+} // namespace details
+
 template <typename RetType, typename... Args>
-using move_only_delegate = basic_move_only_delegate<RetType, false, Args...>;
+using delegate = details::DelegateBase<RetType, false, Args...>;
+
+template <typename RetType, typename... Args>
+using move_only_delegate = details::MoveOnlyDelegateBase<RetType, false, Args...>;
 
 template <typename Ty>
 class multicast_delegate;
